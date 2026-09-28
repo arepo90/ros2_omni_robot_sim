@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import math
+import warnings
 from dataclasses import dataclass, fields
 
 import numpy as np
@@ -48,7 +49,9 @@ class OmniParams:
     rollers_per_row: int = 3
     row_spacing: float = 0.006  # axial distance between the two row planes [m]
     roller_radius: float = 0.005  # roller radius at its middle [m]
-    roller_overlap_deg: float = 4.0  # extra angular coverage so rows overlap
+    roller_overlap_deg: float = 4.0  # mesh rollers: extra angular coverage so rows overlap
+    roller_half_length: float = 0.0  # half the roller length [m]; 0 = auto (see roller_half_length())
+    roller_end_gap: float = 0.001  # min clearance between roller ends in one row (spokes/pins) [m]
     hub_mass: float = 0.008  # [kg] per wheel
     roller_mass: float = 0.0005  # [kg] per roller
     roller_damping: float = 1e-7  # bearing friction of rollers [N m s/rad]
@@ -94,54 +97,99 @@ def _fmt(v):
     return " ".join(f"{x:.6g}" for x in v)
 
 
-def _roller_mesh(p: OmniParams, n_s=17, n_phi=32):
+def _roller_outline(p: OmniParams, shape, half_len, n=61):
+    """Roller cross-section in the wheel plane as (radial, axial) points around its centre."""
+    rho0 = p.roller_radius
+    if shape == "ellipsoid":
+        t = np.linspace(0, 2 * np.pi, 2 * n, endpoint=False)
+        return np.stack([rho0 * np.cos(t), half_len * np.sin(t)], 1)
+    r, d = p.wheel_radius, p.wheel_radius - rho0
+    s = np.linspace(-half_len, half_len, n)
+    rho = np.sqrt(r * r - s * s) - d
+    cap = np.linspace(-rho[0], rho[0], 11)
+    return np.concatenate([
+        np.stack([rho, s], 1), np.stack([-rho, s], 1),
+        np.stack([cap, np.full_like(cap, s[0])], 1), np.stack([cap, np.full_like(cap, s[-1])], 1),
+    ])
+
+
+def _place(p: OmniParams, outline, phi):
+    """Outline of a roller centred at wheel angle phi, in wheel-plane coordinates."""
+    er, et = np.array([np.cos(phi), np.sin(phi)]), np.array([-np.sin(phi), np.cos(phi)])
+    return (p.wheel_radius - p.roller_radius) * er + outline[:, :1] * er + outline[:, 1:] * et
+
+
+def max_roller_half_length(p: OmniParams, shape):
+    """Longest roller that leaves roller_end_gap to its neighbour in the same row.
+
+    Matters for single-row (thin) wheels, where neighbours sit only 360/n degrees apart.
+    """
+    r, d = p.wheel_radius, p.wheel_radius - p.roller_radius
+    hi = 0.98 * math.sqrt(r * r - d * d) if shape == "mesh" else 3 * math.sqrt(p.roller_radius * r)
+    gap = max(p.roller_end_gap, 1e-5)
+
+    def clear(a):
+        A = _place(p, _roller_outline(p, shape, a), 0.0)
+        B = _place(p, _roller_outline(p, shape, a), 2 * math.pi / p.rollers_per_row)
+        return np.min(np.linalg.norm(A[:, None] - B[None], axis=2)) >= gap
+
+    if clear(hi):
+        return hi
+    lo = 1e-5
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if clear(mid) else (lo, mid)
+    return lo
+
+
+def wheel_envelope(p: OmniParams, shape, half_len, n=1441):
+    """Rolling radius vs. wheel angle (the wheel's 'roundness') for the given rollers."""
+    outline = _roller_outline(p, shape, half_len)
+    pts = np.concatenate([
+        _place(p, outline, 2 * np.pi * j / p.rollers_per_row + k * np.pi / p.rollers_per_row)
+        for k in range(p.rows) for j in range(p.rollers_per_row)
+    ])
+    psi = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return (pts @ np.stack([np.cos(psi), np.sin(psi)])).max(0)
+
+
+def roller_half_length(p: OmniParams):
+    """Semi-length of the rollers actually generated, plus the rolling radius range.
+
+    Ellipsoid: sqrt(rho0 * r) matches the wheel curvature at the roller middle; a slightly
+    longer roller flattens the dips where contact hands over, so the length is tuned for
+    roundness, capped so rollers in one row don't overlap. Mesh: the exact profile over
+    180/(rows*n) + roller_overlap_deg, with the same cap. roller_half_length > 0 overrides.
+    Returns (half_len, env_min, env_max, max_half_len).
+    """
+    shape = p.roller_shape
+    a_max = max_roller_half_length(p, shape)
+    if p.roller_half_length > 0:
+        a = p.roller_half_length
+    elif shape == "mesh":
+        alpha = math.radians(180.0 / (p.rows * p.rollers_per_row) + p.roller_overlap_deg)
+        a = min(p.wheel_radius * math.sin(alpha), a_max)
+    else:
+        a0 = math.sqrt(p.roller_radius * p.wheel_radius)
+        hi = min(1.6 * a0, a_max)
+        a = min(np.linspace(min(a0, hi), hi, 61), key=lambda a: np.ptp(wheel_envelope(p, shape, a)))
+    env = wheel_envelope(p, shape, a)
+    return a, env.min(), env.max(), a_max
+
+
+def _roller_mesh(p: OmniParams, half_len, n_s=17, n_phi=32):
     """Barrel whose surface lies on the wheel's rolling circle.
 
     A roller whose axis is tangent to the wheel at distance d = r - rho0 from the
     hub has, at axial position s, radius rho(s) = sqrt(r^2 - s^2) - d.
     """
-    r, rho0 = p.wheel_radius, p.roller_radius
-    d = r - rho0
-    alpha = math.radians(180.0 / (p.rows * p.rollers_per_row) + p.roller_overlap_deg)
-    s_max = r * math.sin(alpha)
-    rho_end = r * math.cos(alpha) - d
-    if rho_end <= 0.2 * rho0:
-        raise ValueError(
-            f"rollers too thin to cover the wheel: end radius {rho_end*1e3:.2f} mm. "
-            "Increase roller_radius or rollers_per_row/rows."
-        )
+    r, d = p.wheel_radius, p.wheel_radius - p.roller_radius
     verts = []
-    for s in np.linspace(-s_max, s_max, n_s):
+    for s in np.linspace(-half_len, half_len, n_s):
         rho = math.sqrt(r * r - s * s) - d
         for a in np.linspace(0, 2 * math.pi, n_phi, endpoint=False):
             verts += [rho * math.cos(a), rho * math.sin(a), s]
-    return verts, d, s_max
-
-
-def _envelope(p: OmniParams, half_len, n=3601):
-    """Rolling radius vs. wheel angle for ellipsoid rollers of semi-length half_len."""
-    rho0 = p.roller_radius
-    d = p.wheel_radius - rho0
-    psi = np.linspace(0, 2 * np.pi, n)
-    env = np.zeros_like(psi)
-    for k in range(p.rows):
-        for j in range(p.rollers_per_row):
-            dl = psi - (2 * np.pi * j / p.rollers_per_row + k * np.pi / p.rollers_per_row)
-            env = np.maximum(env, d * np.cos(dl) + np.sqrt((rho0 * np.cos(dl)) ** 2 + (half_len * np.sin(dl)) ** 2))
-    return env
-
-
-def ellipsoid_roller_length(p: OmniParams):
-    """Semi-length of an ellipsoid roller that keeps the wheel as round as possible.
-
-    sqrt(rho0 * r) matches the wheel's curvature at the roller middle; a slightly
-    longer roller flattens the dips where the contact hands over between rollers.
-    Returns (semi_length, envelope_min, envelope_max).
-    """
-    a0 = math.sqrt(p.roller_radius * p.wheel_radius)
-    a = min(np.linspace(a0, 1.6 * a0, 121), key=lambda a: np.ptp(_envelope(p, a)))
-    env = _envelope(p, a)
-    return a, env.min(), env.max()
+    return verts
 
 
 def build_mjcf(p: OmniParams) -> str:
@@ -151,13 +199,16 @@ def build_mjcf(p: OmniParams) -> str:
         raise ValueError("roller_shape must be 'ellipsoid' or 'mesh'")
     if p.rows not in (1, 2):
         raise ValueError("rows must be 1 or 2")
-    verts, d, s_max = _roller_mesh(p)  # also validates that the rollers cover the wheel
     r = p.wheel_radius
+    d = r - p.roller_radius  # hub centre -> roller axis
+    a, _, _, a_max = roller_half_length(p)
+    if a > a_max * 1.001:
+        warnings.warn(f"roller_half_length {a*1e3:.2f} mm overlaps the neighbouring roller "
+                      f"(max {a_max*1e3:.2f} mm with roller_end_gap {p.roller_end_gap*1e3:g} mm)")
     if p.roller_shape == "mesh":
         roller_geom = 'type="mesh" mesh="roller"'
-        mesh_asset = f'<mesh name="roller" vertex="{_fmt(verts)}"/>'
+        mesh_asset = f'<mesh name="roller" vertex="{_fmt(_roller_mesh(p, a))}"/>'
     else:
-        a, _, _ = ellipsoid_roller_length(p)
         roller_geom = f'type="ellipsoid" size="{p.roller_radius:g} {p.roller_radius:g} {a:.5g}"'
         mesh_asset = ""
     # Contact bits: floor=1; rollers collide only with the floor/ball (contype 2);
@@ -271,9 +322,9 @@ def main():
     with open(out, "w") as fh:
         fh.write(build_mjcf(p))
     print(f"wrote {out}")
-    if p.roller_shape == "ellipsoid":
-        a, lo, hi = ellipsoid_roller_length(p)
-        print(f"ellipsoid rollers: semi-length {a*1e3:.2f} mm, rolling radius {lo*1e3:.3f}..{hi*1e3:.3f} mm")
+    a, lo, hi, a_max = roller_half_length(p)
+    print(f"{p.roller_shape} rollers: half-length {a*1e3:.2f} mm (same-row limit {a_max*1e3:.2f} mm), "
+          f"rolling radius {lo*1e3:.3f}..{hi*1e3:.3f} mm (bump {(hi-lo)*1e3:.3f} mm)")
     print("wheel jacobian (rad/s per [vx, vy, wz]):\n", np.round(wheel_jacobian(p), 3))
 
 

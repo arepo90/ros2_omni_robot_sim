@@ -4,6 +4,7 @@
 pip install mujoco numpy          # + xacro for import_repo_urdf.py
 python omni_mjcf.py               # writes vsss_omni4.xml (placeholder 75 mm, 4-wheel VSSS robot)
 python test_drive.py              # drives it through the wheel Jacobian and checks what it does
+python test_drive.py --rows 1 --rollers_per_row 10 --roller_radius 0.003   # any parameter can be overridden
 python -m mujoco.viewer --mjcf=vsss_omni4.xml
 ```
 
@@ -23,9 +24,11 @@ chassis (free body)
      └─ roller_i_kj   hinge, passive. Axis is tangent to the wheel. rows × rollers_per_row per wheel
 ```
 
-The rollers are ellipsoids whose length is tuned so the wheel's rolling radius stays within
-about 0.1 mm of `wheel_radius`. Ellipsoid–plane contact is analytic and smooth. A faceted
-mesh roller (`--roller_shape mesh`) caused visible fake vibration at speed.
+By default the rollers are ellipsoids whose length is tuned so the wheel's rolling radius stays
+within about 0.1 mm of `wheel_radius`. Ellipsoid–plane contact is analytic and smooth; a coarse
+faceted mesh roller caused fake vibration at speed. `--roller_shape mesh` gives the exact barrel
+profile with blunt ends. Roller length is always capped so rollers in the same row keep
+`roller_end_gap` between them, or you can set it with `roller_half_length`.
 
 Kinematics, for wheel i at angle θ_i, distance R (centre to wheel mid-plane) and rolling radius r:
 
@@ -43,7 +46,8 @@ or the wheels scrub.
 The defaults are placeholders. Measure or look up the following:
 
 - `wheel_radius`, `wheel_R`, `heading_offset_deg` (−45 = X layout, 0 = + layout)
-- `rows`, `rollers_per_row`, `roller_radius`, `row_spacing` (from the wheel you buy or print)
+- `rows`, `rollers_per_row`, `roller_radius`, `row_spacing`, `roller_half_length`,
+  `roller_end_gap` (from the wheel you buy or print; `rows 1` for thin single-row wheels)
 - `body_mass`, `com_height`, `hub_mass`, `roller_mass`
 - motor, measured at the wheel after the gearbox: `stall_torque`, `no_load_speed`,
   `nominal_voltage`, `wheel_armature` (rotor inertia × gear²)
@@ -65,6 +69,24 @@ linear DC motor, τ = (τ_stall/V)·u − (τ_stall/ω₀)·ω, which exposes to
 A full-throttle launch with the placeholder DC motors is traction-limited. The motors can push
 about 11× more force than friction allows (μ·m·g ≈ 1.5 N). The wheels spin, encoder odometry is off by more than 1 m/s,
 and the robot chatters. Limit acceleration to about μ·g in firmware.
+
+## Thin, single-row wheels
+
+With one row, neighbouring rollers are only 360°/n apart, so they have to be short and the
+wheel has real dips at the gaps. Example: a 32 mm wheel with 10 rollers of Ø6 mm.
+
+| roller ends | rolling radius | distance vs nominal r | vertical vibration at 1 m/s |
+|---|---|---|---|
+| pointy (ellipsoid) | 15.42–16.00 mm | 98 % | ~0.9 g rms, airborne ~10 % of the time |
+| blunt (mesh) | 15.85–16.00 mm | 96–98 % | ~0.9 g rms, airborne ~25 % of the time |
+| (2×3 double row, for comparison) | 16.00–16.08 mm | 100 % | ~0.3 g rms, never airborne |
+
+- Calibrate `r` on the real robot (distance per wheel revolution) rather than using the
+  nominal diameter.
+- The vibration level depends on how soft the contact is (`contact_timeconst`, standing in for
+  rubber and chassis compliance). Tune it until the sim matches what the real robot does.
+- The roller end shape matters here, so your real roller profile is better than either
+  approximation.
 
 ## Notes
 

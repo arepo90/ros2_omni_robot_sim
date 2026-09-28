@@ -7,11 +7,12 @@ that the chassis actually does what was commanded.
 """
 import argparse
 import time
+from dataclasses import fields
 
 import mujoco
 import numpy as np
 
-from omni_mjcf import OmniParams, build_mjcf, wheel_jacobian
+from omni_mjcf import OmniParams, build_mjcf, roller_half_length, wheel_jacobian
 
 
 def yaw_of(q):
@@ -74,18 +75,21 @@ def launch_test(m, d, p, T=0.6):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--motor", default="servo", choices=["servo", "dc"])
-    ap.add_argument("--roller_shape", default="ellipsoid", choices=["ellipsoid", "mesh"])
+    ap = argparse.ArgumentParser(description="any OmniParams field can be overridden, e.g. --rows 1 --rollers_per_row 10")
+    for f in fields(OmniParams):
+        ap.add_argument(f"--{f.name}", type=type(f.default), default=f.default)
     ap.add_argument("--save", help="also write the MJCF here")
-    a = ap.parse_args()
-    p = OmniParams(motor=a.motor, roller_shape=a.roller_shape)
+    a = vars(ap.parse_args())
+    save = a.pop("save")
+    p = OmniParams(**a)
     xml = build_mjcf(p)
-    if a.save:
-        open(a.save, "w").write(xml)
+    if save:
+        open(save, "w").write(xml)
     m = mujoco.MjModel.from_xml_string(xml)
     d = mujoco.MjData(m)
     mass = m.body_subtreemass[1]
+    a_r, lo, hi, _ = roller_half_length(p)
+    print(f"wheel: {p.rows}x{p.rollers_per_row} {p.roller_shape} rollers, rolling radius {lo*1e3:.3f}..{hi*1e3:.3f} mm")
     print(f"model: {m.nbody-1} bodies, {m.njnt} joints, {m.nu} motors, mass {mass*1e3:.0f} g, dt {m.opt.timestep*1e3:g} ms")
     settle(m, d, 0.5)
     print(f"  rest height of axle {d.qpos[2]*1e3:.2f} mm (ideal {p.wheel_radius*1e3:.2f}), "
