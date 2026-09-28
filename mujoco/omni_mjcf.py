@@ -21,6 +21,7 @@ reused as collision geometry; the chassis here is a box and the hub is visual on
 
 Usage:
   python omni_mjcf.py                  # writes vsss_omni4.xml with the defaults
+  python omni_mjcf.py --preset vsss -o my_robot.xml   # the real robot
   python omni_mjcf.py --motor dc -o my_robot.xml
   python -m mujoco.viewer --mjcf=vsss_omni4.xml
 """
@@ -57,20 +58,64 @@ class OmniParams:
     lobe_offset: float = 0.0  # peanut: roller middle -> rim centre along the axle [m]; 0 = rims evenly spaced
     lobe_half_length: float = 0.0  # peanut: rim semi-thickness along the axle [m]; 0 = 0.5 * roller_radius
     hub_mass: float = 0.008  # [kg] per wheel
+    hub_radius: float = 0.0  # >0: the hub also collides with the floor as a disc this big (catches hub strikes) [m]
+    hub_thickness: float = 0.0035  # [m], for the hub collision disc
     roller_mass: float = 0.0005  # [kg] per roller
     roller_damping: float = 1e-7  # bearing friction of rollers [N m s/rad]
     friction: float = 0.8  # roller/floor sliding friction
-    contact_timeconst: float = 0.01  # roller contact softness [s] (>= 2*timestep); stiffer -> chatter at high rpm
+    contact_timeconst: float = 0.01  # roller contact softness [s] (>= 2*timestep); ~1/(vertical bounce freq in rad/s)
+    contact_dampratio: float = 1.0  # roller contact damping ratio (rubber: < 1 is bouncier)
     # --- motor ---------------------------------------------------------------------
     motor: str = "servo"  # "servo": ideal-ish speed loop (like the Gazebo sim); "dc": voltage-driven DC motor
     servo_kv: float = 0.05  # speed-loop gain [N m / (rad/s)]
     max_wheel_speed: float = 60.0  # servo ctrl range [rad/s]
     stall_torque: float = 0.10  # at the wheel (after gearbox) [N m]; also servo torque limit
     no_load_speed: float = 62.8  # at the wheel, at nominal_voltage [rad/s]
-    nominal_voltage: float = 6.0
+    nominal_voltage: float = 6.0  # voltage the stall torque / no-load speed are quoted at
+    supply_voltage: float = 0.0  # battery voltage the dc motor model is driven with; 0 = nominal_voltage
     wheel_armature: float = 1e-5  # reflected rotor inertia J_rotor * gear^2 [kg m^2]
     # --- simulation ------------------------------------------------------------
     timestep: float = 0.0005
+
+
+PRESETS = {
+    # placeholder 75 mm robot with a double-row wheel
+    "generic": {},
+    # the real robot: 4x GA12-N20 12 V 381 rpm (90-degree output), 6 silicone spool rollers per wheel
+    "vsss": dict(
+        n_wheels=4, heading_offset_deg=-45.0, wheel_R=0.034,  # wheels on the diagonals, 34 mm out
+        body_size=0.075, body_mass=0.214,  # 230 g total minus ~4 g per wheel
+        com_height=0.020,  # PLACEHOLDER
+        wheel_radius=0.01725, roller_shape="peanut", rows=1, rollers_per_row=6,  # wheel fits a 34.5 mm circle
+        roller_radius=0.00335, lobe_half_length=0.00128,  # 6.7 mm ends; rims sized for a 9.8 mm roller
+        hub_radius=0.0157, hub_thickness=0.0034,  # hub fits a 31.4 mm circle
+        hub_mass=0.0022, roller_mass=0.0003,  # estimated from PLA / silicone volumes
+        friction=1.0,  # PLACEHOLDER: silicone on the field surface
+        contact_timeconst=0.005,  # Hertz estimate for ~A35 silicone rims: ~0.35 mm squash, ~33 Hz bounce
+        nominal_voltage=12.0, no_load_speed=39.9, max_wheel_speed=39.9,  # 381 rpm at 12 V
+        stall_torque=0.06,  # PLACEHOLDER [N m]: from the listing / a stall test
+        wheel_armature=2e-5,  # PLACEHOLDER: N20 rotor inertia x gear ratio^2
+    ),
+}
+
+
+def make_params(preset="generic", **overrides) -> OmniParams:
+    return OmniParams(**{**PRESETS[preset], **overrides})
+
+
+def add_param_args(ap: argparse.ArgumentParser):
+    """--preset plus one --<field> option per OmniParams field, defaulting to the preset's value."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--preset", default="generic", choices=sorted(PRESETS))
+    base = make_params(pre.parse_known_args()[0].preset)
+    ap.add_argument("--preset", default="generic", choices=sorted(PRESETS))
+    for f in fields(OmniParams):
+        ap.add_argument(f"--{f.name}", type=type(f.default), default=getattr(base, f.name))
+
+
+def params_from_args(a: dict) -> OmniParams:
+    a.pop("preset", None)
+    return OmniParams(**{k: v for k, v in a.items() if k in {f.name for f in fields(OmniParams)}})
 
 
 def wheel_angles(p: OmniParams) -> np.ndarray:
@@ -290,6 +335,13 @@ def build_mjcf(p: OmniParams) -> str:
         p.body_mass / 6 * p.body_size**2,
     )
 
+    if p.hub_radius > 0:  # PLA hub touching the floor when the rubber rollers squash
+        hub = (f'<geom type="cylinder" size="{p.hub_radius:g} {p.hub_thickness/2:g}" mass="{p.hub_mass:g}" '
+               f'priority="1" friction="0.3 0.005 0.0001" solref="0.002 1" rgba=".1 .1 .1 1" {roller}/>')
+    else:
+        hub = (f'<geom type="cylinder" size="{d*0.9:.5g} {p.row_spacing/2 + p.roller_radius*0.6:.5g}" '
+               f'mass="{p.hub_mass:g}" rgba=".8 .8 .8 1" {visual}/>')
+
     wheels = []
     row_z = [0.0] if p.rows == 1 else [-p.row_spacing / 2, p.row_spacing / 2]
     for i, th in enumerate(wheel_angles(p), start=1):
@@ -310,12 +362,12 @@ def build_mjcf(p: OmniParams) -> str:
         wheels.append(
             f'<body name="wheel_{i}" pos="{_fmt(pos)}" zaxis="{_fmt(axle)}">'
             f'<joint name="wheel_{i}" axis="0 0 1" armature="{p.wheel_armature:g}"/>'
-            f'<geom type="cylinder" size="{d*0.9:.5g} {p.row_spacing/2 + p.roller_radius*0.6:.5g}" '
-            f'mass="{p.hub_mass:g}" rgba=".8 .8 .8 1" {visual}/>'
+            + hub
             + "".join(rollers)
             + "</body>"
         )
 
+    volts = p.supply_voltage or p.nominal_voltage
     acts = []
     for i in range(1, p.n_wheels + 1):
         if p.motor == "servo":
@@ -329,7 +381,7 @@ def build_mjcf(p: OmniParams) -> str:
                 f'<general name="motor_{i}" joint="wheel_{i}" '
                 f'gainprm="{p.stall_torque/p.nominal_voltage:g}" biastype="affine" '
                 f'biasprm="0 0 {-p.stall_torque/p.no_load_speed:g}" '
-                f'ctrlrange="{-p.nominal_voltage:g} {p.nominal_voltage:g}"/>'
+                f'ctrlrange="{-volts:g} {volts:g}"/>'
             )
 
     sensors = "".join(
@@ -341,7 +393,7 @@ def build_mjcf(p: OmniParams) -> str:
   <option timestep="{p.timestep:g}" integrator="implicitfast"/>
   <default>
     <default class="roller">
-      <geom priority="1" friction="{p.friction:g} 0.005 0.0001" solref="{p.contact_timeconst:g} 1" rgba=".1 .1 .1 1"/>
+      <geom priority="1" friction="{p.friction:g} 0.005 0.0001" solref="{p.contact_timeconst:g} {p.contact_dampratio:g}" rgba=".1 .1 .1 1"/>
     </default>
   </default>
   <asset>
@@ -376,15 +428,16 @@ def build_mjcf(p: OmniParams) -> str:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--out", default="vsss_omni4.xml")
-    for f in fields(OmniParams):
-        ap.add_argument(f"--{f.name}", type=type(f.default), default=f.default)
+    add_param_args(ap)
     a = vars(ap.parse_args())
     out = a.pop("out")
-    p = OmniParams(**a)
+    p = params_from_args(a)
     with open(out, "w") as fh:
         fh.write(build_mjcf(p))
     print(f"wrote {out}")
-    print(describe_rollers(p, roller_geometry(p)))
+    g = roller_geometry(p)
+    print(describe_rollers(p, g))
+    print(f"use r = {g.r_eff*1e3:.3f} mm (effective rolling radius) in the kinematics")
     print("wheel jacobian (rad/s per [vx, vy, wz]):\n", np.round(wheel_jacobian(p), 3))
 
 

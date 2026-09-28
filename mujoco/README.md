@@ -2,8 +2,9 @@
 
 ```bash
 pip install mujoco numpy          # + xacro for import_repo_urdf.py
-python omni_mjcf.py               # writes vsss_omni4.xml (placeholder 75 mm, 4-wheel VSSS robot)
-python test_drive.py              # drives it through the wheel Jacobian and checks what it does
+python omni_mjcf.py --preset vsss # writes vsss_omni4.xml for the real robot (see below)
+python test_drive.py --preset vsss   # drives it through the wheel Jacobian and checks what it does
+python omni_mjcf.py               # without --preset: a generic placeholder 75 mm robot
 python test_drive.py --rows 1 --rollers_per_row 10 --roller_radius 0.003   # any parameter can be overridden
 python test_drive.py --roller_shape peanut --rows 1 --rollers_per_row 6 --roller_radius 0.0035
 python -m mujoco.viewer --mjcf=vsss_omni4.xml
@@ -14,6 +15,45 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 | `omni_mjcf.py` | Parametric MJCF generator. Any wheel count, layout, size, roller count, motor model. Also has `wheel_jacobian()` / `body_twist()` (same math as `src/kinematics.cpp`). |
 | `test_drive.py` | Open-loop tracking test (vx, vy, diagonal, spin, arc) plus a full-throttle launch test for `--motor dc`. |
 | `import_repo_urdf.py` | 1:1 import of the Gazebo robots (`3w_v2`, `4w`, `5w`, `6w`) for comparison. |
+
+## The real robot (`--preset vsss`)
+
+| spec | parameter |
+|---|---|
+| 7.5 cm base, wheels on the diagonals, centres 34 mm from the base centre | `heading_offset_deg -45`, `wheel_R 0.034` |
+| wheel fits a Ø34.5 mm circle, hub a Ø31.4 mm circle | `wheel_radius 0.01725`, `hub_radius 0.0157` (the hub collides, to catch strikes) |
+| 6 silicone spool rollers, 9.8 mm long, Ø6.7 mm ends, Ø5 mm waist | `roller_shape peanut`, `rows 1`, `rollers_per_row 6`, `roller_radius 0.00335`, `lobe_half_length 0.00128` |
+| 230 g total | `body_mass 0.214` (+ ~4 g per wheel, estimated) |
+| 4x GA12-N20, 12 V, 381 rpm | `nominal_voltage 12`, `no_load_speed 39.9` |
+
+Derived geometry: contact rims at ±15°, rolling radius 16.49–17.27 mm, **effective radius
+17.06 mm**. The waist stays 0.85 mm and the hub 0.79 mm off the floor. Silicone around A30–35
+should squash about 0.35 mm per rim under the robot's weight (Hertz estimate), so the hub margin is
+small. It also gives a ~33 Hz vertical bounce, hence `contact_timeconst 0.005`.
+
+Results: open-loop tracking 97–100 % (the effective radius predicts 98.9 %), top speed 0.92 m/s
+at 12 V, full-throttle launch traction-limited (wheelspin) with the placeholder torque.
+
+Vibration is predicted to peak around 0.4–0.5 m/s. There the 12 contacts per wheel revolution
+pass at ~40 Hz, close to the ~33 Hz bounce of the silicone rims:
+
+| speed | vertical vibration | airborne | with `contact_timeconst 0.01` |
+|---|---|---|---|
+| 0.3 m/s | 0.67 g rms | 3 % | 0.54 g, 3 % |
+| 0.5 m/s | 1.25 g rms | 29 % | 0.75 g, 2 % |
+| 0.8 m/s | 1.26 g rms | 22 % | 0.87 g, 6 % |
+
+`contact_dampratio 0.5` roughly doubles the airborne time. The hub never touched the floor in these
+runs, but the simulated contact barely squashes, so the real margin is smaller.
+
+Still placeholders: `stall_torque`, `wheel_armature`, `com_height`, `friction`, `supply_voltage`.
+To calibrate on the real robot:
+
+- **Effective radius:** measure distance per wheel revolution. MuJoCo's soft contact sinks only
+  ~0.03 mm at rest, not the ~0.35 mm the silicone does, so the ~2 % radius loss from squash must
+  come from this measurement.
+- **Contact softness:** compare vibration against the robot's IMU and tune `contact_timeconst` /
+  `contact_dampratio`.
 
 ## How the wheel model works
 

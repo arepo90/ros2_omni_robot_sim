@@ -12,7 +12,7 @@ from dataclasses import fields
 import mujoco
 import numpy as np
 
-from omni_mjcf import OmniParams, build_mjcf, describe_rollers, roller_geometry, wheel_jacobian
+from omni_mjcf import OmniParams, add_param_args, build_mjcf, describe_rollers, params_from_args, roller_geometry, wheel_jacobian
 
 
 def yaw_of(q):
@@ -37,7 +37,8 @@ def track(m, d, p, cmd, T=1.5):
     settle(m, d)
     w = J @ np.array(cmd)
     if p.motor == "dc":  # open-loop voltage from the linear motor curve (no load)
-        d.ctrl[:] = np.clip(w / p.no_load_speed * p.nominal_voltage, -p.nominal_voltage, p.nominal_voltage)
+        v_max = p.supply_voltage or p.nominal_voltage
+        d.ctrl[:] = np.clip(w / p.no_load_speed * p.nominal_voltage, -v_max, v_max)
     else:
         d.ctrl[:] = w
     n = int(T / m.opt.timestep)
@@ -55,7 +56,7 @@ def launch_test(m, d, p, T=0.6):
     J = wheel_jacobian(p)
     settle(m, d)
     dirn = J @ np.array([1.0, 0, 0])
-    d.ctrl[:] = p.nominal_voltage * dirn / np.abs(dirn).max()
+    d.ctrl[:] = (p.supply_voltage or p.nominal_voltage) * dirn / np.abs(dirn).max()
     t, vx, slip, air = [], [], [], 0
     for k in range(int(T / m.opt.timestep)):
         mujoco.mj_step(m, d)
@@ -75,13 +76,13 @@ def launch_test(m, d, p, T=0.6):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="any OmniParams field can be overridden, e.g. --rows 1 --rollers_per_row 10")
-    for f in fields(OmniParams):
-        ap.add_argument(f"--{f.name}", type=type(f.default), default=f.default)
+    ap = argparse.ArgumentParser(description="--preset vsss for the real robot; any OmniParams field can be "
+                                             "overridden, e.g. --rows 1 --rollers_per_row 10")
+    add_param_args(ap)
     ap.add_argument("--save", help="also write the MJCF here")
     a = vars(ap.parse_args())
     save = a.pop("save")
-    p = OmniParams(**a)
+    p = params_from_args(a)
     xml = build_mjcf(p)
     if save:
         open(save, "w").write(xml)
