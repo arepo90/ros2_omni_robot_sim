@@ -10,7 +10,9 @@ IEEE VSSS robot):
   * rollers are barrels whose surface follows the wheel's rolling circle (same idea
     as ../meshes/4w/roller.stl), so the wheel stays round. Default is an ellipsoid
     with its length tuned to minimise the bump (smooth analytic contact, no
-    faceting vibration); roller_shape="mesh" gives the exact profile as a mesh,
+    faceting vibration); roller_shape="mesh" gives the exact profile as a mesh;
+    roller_shape="peanut" gives spool / figure-8 rollers (two ellipsoid rims on one
+    axle) that touch the floor with their ends, not their waist,
   * wheel i sits at angle heading_offset + 360*i/N, spin axis pointing inward
     (same sign convention as src/kinematics.cpp: +speed -> CCW tangent motion).
 
@@ -44,14 +46,16 @@ class OmniParams:
     com_height: float = 0.020  # chassis centre of mass above the floor [m] (battery low = small)
     # --- omni wheel ----------------------------------------------------------------
     wheel_radius: float = 0.016  # rolling radius (the r in the kinematics) [m]
-    roller_shape: str = "ellipsoid"  # "ellipsoid" (smooth, fast) or "mesh" (exact profile, faceted)
+    roller_shape: str = "ellipsoid"  # "ellipsoid" (smooth, fast), "mesh" (exact barrel, faceted), "peanut" (spool: 2 rims)
     rows: int = 2  # roller rows per wheel (1 or 2)
     rollers_per_row: int = 3
     row_spacing: float = 0.006  # axial distance between the two row planes [m]
-    roller_radius: float = 0.005  # roller radius at its middle [m]
+    roller_radius: float = 0.005  # max roller radius [m] (middle of a barrel, end rims of a peanut/spool)
     roller_overlap_deg: float = 4.0  # mesh rollers: extra angular coverage so rows overlap
-    roller_half_length: float = 0.0  # half the roller length [m]; 0 = auto (see roller_half_length())
+    roller_half_length: float = 0.0  # half the roller length [m]; 0 = auto (see roller_geometry())
     roller_end_gap: float = 0.001  # min clearance between roller ends in one row (spokes/pins) [m]
+    lobe_offset: float = 0.0  # peanut: roller middle -> rim centre along the axle [m]; 0 = rims evenly spaced
+    lobe_half_length: float = 0.0  # peanut: rim semi-thickness along the axle [m]; 0 = 0.5 * roller_radius
     hub_mass: float = 0.008  # [kg] per wheel
     roller_mass: float = 0.0005  # [kg] per roller
     roller_damping: float = 1e-7  # bearing friction of rollers [N m s/rad]
@@ -97,84 +101,135 @@ def _fmt(v):
     return " ".join(f"{x:.6g}" for x in v)
 
 
-def _roller_outline(p: OmniParams, shape, half_len, n=61):
+@dataclass
+class RollerGeometry:
+    d: float  # hub centre -> roller axis
+    half_len: float  # roller semi-length (peanut: semi-length of each lobe)
+    lobe_offset: float  # peanut: roller middle -> lobe centre along the axle (0 otherwise)
+    max_half_len: float  # longest half_len that keeps roller_end_gap to the same-row neighbour
+    env_min: float  # rolling radius range over a revolution (the wheel's roundness)
+    env_max: float
+    r_eff: float  # effective rolling radius = distance per revolution / 2pi (use it in the kinematics)
+
+
+def _outline(p: OmniParams, half_len, s_l=0.0, n=61):
     """Roller cross-section in the wheel plane as (radial, axial) points around its centre."""
     rho0 = p.roller_radius
-    if shape == "ellipsoid":
-        t = np.linspace(0, 2 * np.pi, 2 * n, endpoint=False)
-        return np.stack([rho0 * np.cos(t), half_len * np.sin(t)], 1)
-    r, d = p.wheel_radius, p.wheel_radius - rho0
-    s = np.linspace(-half_len, half_len, n)
-    rho = np.sqrt(r * r - s * s) - d
-    cap = np.linspace(-rho[0], rho[0], 11)
-    return np.concatenate([
-        np.stack([rho, s], 1), np.stack([-rho, s], 1),
-        np.stack([cap, np.full_like(cap, s[0])], 1), np.stack([cap, np.full_like(cap, s[-1])], 1),
-    ])
+    if p.roller_shape == "mesh":
+        r, d = p.wheel_radius, p.wheel_radius - rho0
+        s = np.linspace(-half_len, half_len, n)
+        rho = np.sqrt(r * r - s * s) - d
+        cap = np.linspace(-rho[0], rho[0], 11)
+        return np.concatenate([
+            np.stack([rho, s], 1), np.stack([-rho, s], 1),
+            np.stack([cap, np.full_like(cap, s[0])], 1), np.stack([cap, np.full_like(cap, s[-1])], 1),
+        ])
+    t = np.linspace(0, 2 * np.pi, 2 * n, endpoint=False)
+    ell = np.stack([rho0 * np.cos(t), half_len * np.sin(t)], 1)
+    return ell if p.roller_shape == "ellipsoid" else np.concatenate([ell + [0, s_l], ell - [0, s_l]])
 
 
-def _place(p: OmniParams, outline, phi):
-    """Outline of a roller centred at wheel angle phi, in wheel-plane coordinates."""
+def _place(outline, d, phi):
+    """Outline of a roller whose axis is at distance d, centred at wheel angle phi."""
     er, et = np.array([np.cos(phi), np.sin(phi)]), np.array([-np.sin(phi), np.cos(phi)])
-    return (p.wheel_radius - p.roller_radius) * er + outline[:, :1] * er + outline[:, 1:] * et
+    return d * er + outline[:, :1] * er + outline[:, 1:] * et
 
 
-def max_roller_half_length(p: OmniParams, shape):
-    """Longest roller that leaves roller_end_gap to its neighbour in the same row.
+def _clear(p: OmniParams, d, half_len, s_l=0.0):
+    """Do neighbouring rollers of one row keep roller_end_gap between them?"""
+    o = _outline(p, half_len, s_l)
+    A, B = _place(o, d, 0.0), _place(o, d, 2 * math.pi / p.rollers_per_row)
+    return np.min(np.linalg.norm(A[:, None] - B[None], axis=2)) >= max(p.roller_end_gap, 1e-5)
 
-    Matters for single-row (thin) wheels, where neighbours sit only 360/n degrees apart.
-    """
-    r, d = p.wheel_radius, p.wheel_radius - p.roller_radius
-    hi = 0.98 * math.sqrt(r * r - d * d) if shape == "mesh" else 3 * math.sqrt(p.roller_radius * r)
-    gap = max(p.roller_end_gap, 1e-5)
 
-    def clear(a):
-        A = _place(p, _roller_outline(p, shape, a), 0.0)
-        B = _place(p, _roller_outline(p, shape, a), 2 * math.pi / p.rollers_per_row)
-        return np.min(np.linalg.norm(A[:, None] - B[None], axis=2)) >= gap
-
-    if clear(hi):
+def _largest(ok, lo, hi, iters=30):
+    """Largest x in [lo, hi] with ok(x), for ok true below some threshold."""
+    if ok(hi):
         return hi
-    lo = 1e-5
-    for _ in range(30):
+    for _ in range(iters):
         mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if clear(mid) else (lo, mid)
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
     return lo
 
 
-def wheel_envelope(p: OmniParams, shape, half_len, n=1441):
-    """Rolling radius vs. wheel angle (the wheel's 'roundness') for the given rollers."""
-    outline = _roller_outline(p, shape, half_len)
+def _envelope(p: OmniParams, d, half_len, s_l=0.0, n=1441):
+    o = _outline(p, half_len, s_l)
     pts = np.concatenate([
-        _place(p, outline, 2 * np.pi * j / p.rollers_per_row + k * np.pi / p.rollers_per_row)
+        _place(o, d, 2 * np.pi * j / p.rollers_per_row + k * np.pi / p.rollers_per_row)
         for k in range(p.rows) for j in range(p.rollers_per_row)
     ])
     psi = np.linspace(0, 2 * np.pi, n, endpoint=False)
     return (pts @ np.stack([np.cos(psi), np.sin(psi)])).max(0)
 
 
-def roller_half_length(p: OmniParams):
-    """Semi-length of the rollers actually generated, plus the rolling radius range.
+def roller_geometry(p: OmniParams) -> RollerGeometry:
+    """Where the rollers sit and how long they are.
 
     Ellipsoid: sqrt(rho0 * r) matches the wheel curvature at the roller middle; a slightly
-    longer roller flattens the dips where contact hands over, so the length is tuned for
-    roundness, capped so rollers in one row don't overlap. Mesh: the exact profile over
-    180/(rows*n) + roller_overlap_deg, with the same cap. roller_half_length > 0 overrides.
-    Returns (half_len, env_min, env_max, max_half_len).
+      longer roller flattens the dips where contact hands over, so the length is tuned for
+      roundness, capped so rollers in one row keep roller_end_gap. roller_half_length overrides.
+    Mesh: the exact barrel profile over 180/(rows*n) + roller_overlap_deg, same cap.
+    Peanut / spool: the contact rims at the two roller ends, each an ellipsoid of radius
+      roller_radius and axial semi-length lobe_half_length (default 0.5 * roller_radius: a
+      disc with a rounded edge), with the rim tips on the rolling circle. By default the
+      2*n rims of a row are evenly spaced around the wheel (6 rollers -> a contact every 30
+      deg); lobe_offset places them explicitly (roller middle -> rim centre along the axle).
     """
-    shape = p.roller_shape
-    a_max = max_roller_half_length(p, shape)
-    if p.roller_half_length > 0:
-        a = p.roller_half_length
-    elif shape == "mesh":
-        alpha = math.radians(180.0 / (p.rows * p.rollers_per_row) + p.roller_overlap_deg)
-        a = min(p.wheel_radius * math.sin(alpha), a_max)
+    r, rho = p.wheel_radius, p.roller_radius
+    c = r - rho
+    if p.roller_shape == "peanut":
+        beta0 = math.pi / (2 * p.rows * p.rollers_per_row)
+
+        def place(a):
+            """(lobe offset, roller axis distance) with the rim tips on the rolling circle."""
+            tip = lambda b: math.sqrt((rho * math.cos(b)) ** 2 + (a * math.sin(b)) ** 2)
+            if p.lobe_offset <= 0:
+                cc = r - tip(beta0)
+                return cc * math.sin(beta0), cc * math.cos(beta0)
+            b = math.asin(min(p.lobe_offset / c, 0.99))
+            for _ in range(20):
+                cc = r - tip(b)
+                b = math.asin(min(p.lobe_offset / cc, 0.99))
+            if p.lobe_offset >= cc:
+                raise ValueError(f"lobe_offset {p.lobe_offset*1e3:.2f} mm is too large for this wheel")
+            return p.lobe_offset, math.sqrt(cc * cc - p.lobe_offset ** 2)
+
+        ok = lambda x: _clear(p, place(x)[1], x, place(x)[0])
+        if not ok(1e-4):
+            raise ValueError("rims of neighbouring rollers collide: reduce roller_radius, "
+                             "roller_end_gap or lobe_offset")
+        a_max = _largest(ok, 1e-4, 2 * rho)
+        a = p.lobe_half_length or min(0.5 * rho, a_max)
+        s_l, d = place(a)
     else:
-        a0 = math.sqrt(p.roller_radius * p.wheel_radius)
-        hi = min(1.6 * a0, a_max)
-        a = min(np.linspace(min(a0, hi), hi, 61), key=lambda a: np.ptp(wheel_envelope(p, shape, a)))
-    env = wheel_envelope(p, shape, a)
-    return a, env.min(), env.max(), a_max
+        s_l, d = 0.0, c
+        hi = 0.98 * math.sqrt(r * r - d * d) if p.roller_shape == "mesh" else 3 * math.sqrt(rho * r)
+        a_max = _largest(lambda x: _clear(p, d, x), 1e-5, hi)
+        if p.roller_half_length > 0:
+            a = p.roller_half_length
+        elif p.roller_shape == "mesh":
+            alpha = math.radians(180.0 / (p.rows * p.rollers_per_row) + p.roller_overlap_deg)
+            a = min(r * math.sin(alpha), a_max)
+        else:
+            a0 = math.sqrt(rho * r)
+            hi = min(1.6 * a0, a_max)
+            a = min(np.linspace(min(a0, hi), hi, 61), key=lambda x: np.ptp(_envelope(p, d, x)))
+    env = _envelope(p, d, a, s_l)
+    # rolling without slip on a convex profile covers its hull perimeter = integral of the
+    # support function, so distance per revolution / 2pi is simply the mean rolling radius
+    return RollerGeometry(d, a, s_l, a_max, env.min(), env.max(), env.mean())
+
+
+def describe_rollers(p: OmniParams, g: RollerGeometry) -> str:
+    txt = f"{p.rows}x{p.rollers_per_row} {p.roller_shape} rollers: "
+    if p.roller_shape == "peanut":
+        txt += (f"rims r={p.roller_radius*1e3:.2f} mm, {2*g.half_len*1e3:.2f} mm thick, at +-{g.lobe_offset*1e3:.2f} mm "
+                f"(+-{math.degrees(math.atan2(g.lobe_offset, g.d)):.1f} deg), roller length "
+                f"{2*(g.lobe_offset+g.half_len)*1e3:.1f} mm, axle {g.d*1e3:.2f} mm from hub")
+    else:
+        txt += f"half-length {g.half_len*1e3:.2f} mm (same-row limit {g.max_half_len*1e3:.2f} mm)"
+    return txt + (f"; rolling radius {g.env_min*1e3:.3f}..{g.env_max*1e3:.3f} mm "
+                  f"(bump {(g.env_max-g.env_min)*1e3:.3f} mm), effective {g.r_eff*1e3:.3f} mm")
 
 
 def _roller_mesh(p: OmniParams, half_len, n_s=17, n_phi=32):
@@ -195,26 +250,33 @@ def _roller_mesh(p: OmniParams, half_len, n_s=17, n_phi=32):
 def build_mjcf(p: OmniParams) -> str:
     if p.motor not in ("servo", "dc"):
         raise ValueError("motor must be 'servo' or 'dc'")
-    if p.roller_shape not in ("ellipsoid", "mesh"):
-        raise ValueError("roller_shape must be 'ellipsoid' or 'mesh'")
+    if p.roller_shape not in ("ellipsoid", "mesh", "peanut"):
+        raise ValueError("roller_shape must be 'ellipsoid', 'mesh' or 'peanut'")
     if p.rows not in (1, 2):
         raise ValueError("rows must be 1 or 2")
     r = p.wheel_radius
-    d = r - p.roller_radius  # hub centre -> roller axis
-    a, _, _, a_max = roller_half_length(p)
+    g = roller_geometry(p)
+    d, a, a_max = g.d, g.half_len, g.max_half_len  # d: hub centre -> roller axis
     if a > a_max * 1.001:
-        warnings.warn(f"roller_half_length {a*1e3:.2f} mm overlaps the neighbouring roller "
+        what = "lobe_half_length" if p.roller_shape == "peanut" else "roller_half_length"
+        warnings.warn(f"{what} {a*1e3:.2f} mm overlaps the neighbouring roller "
                       f"(max {a_max*1e3:.2f} mm with roller_end_gap {p.roller_end_gap*1e3:g} mm)")
+    roller = 'contype="2" conaffinity="1"'
+    ell = (f'type="sphere" size="{p.roller_radius:g}"' if abs(a - p.roller_radius) < 1e-9 else
+           f'type="ellipsoid" size="{p.roller_radius:g} {p.roller_radius:g} {a:.5g}"')
+    mesh_asset = ""
     if p.roller_shape == "mesh":
-        roller_geom = 'type="mesh" mesh="roller"'
+        roller_geoms = f'<geom class="roller" type="mesh" mesh="roller" mass="{p.roller_mass:g}" {roller}/>'
         mesh_asset = f'<mesh name="roller" vertex="{_fmt(_roller_mesh(p, a))}"/>'
+    elif p.roller_shape == "peanut":  # non-convex, so two convex lobes (a mesh would be hulled into a barrel)
+        roller_geoms = "".join(
+            f'<geom class="roller" {ell} pos="0 0 {z:.5g}" mass="{p.roller_mass/2:g}" {roller}/>'
+            for z in (-g.lobe_offset, g.lobe_offset))
     else:
-        roller_geom = f'type="ellipsoid" size="{p.roller_radius:g} {p.roller_radius:g} {a:.5g}"'
-        mesh_asset = ""
+        roller_geoms = f'<geom class="roller" {ell} mass="{p.roller_mass:g}" {roller}/>'
     # Contact bits: floor=1; rollers collide only with the floor/ball (contype 2);
     # chassis (contype 4) collides with floor and other chassis, never own rollers.
     floor = 'contype="1" conaffinity="1"'
-    roller = 'contype="2" conaffinity="1"'
     chassis = 'contype="4" conaffinity="5"'
     visual = 'contype="0" conaffinity="0" group="1"'
 
@@ -242,7 +304,7 @@ def build_mjcf(p: OmniParams) -> str:
                 rollers.append(
                     f'<body name="roller_{i}_{k}{j}" pos="{_fmt(rpos)}" zaxis="{_fmt(raxis)}">'
                     f'<joint name="roller_{i}_{k}{j}" axis="0 0 1" damping="{p.roller_damping:g}"/>'
-                    f'<geom class="roller" {roller_geom} mass="{p.roller_mass:g}" {roller}/>'
+                    + roller_geoms +
                     "</body>"
                 )
         wheels.append(
@@ -322,9 +384,7 @@ def main():
     with open(out, "w") as fh:
         fh.write(build_mjcf(p))
     print(f"wrote {out}")
-    a, lo, hi, a_max = roller_half_length(p)
-    print(f"{p.roller_shape} rollers: half-length {a*1e3:.2f} mm (same-row limit {a_max*1e3:.2f} mm), "
-          f"rolling radius {lo*1e3:.3f}..{hi*1e3:.3f} mm (bump {(hi-lo)*1e3:.3f} mm)")
+    print(describe_rollers(p, roller_geometry(p)))
     print("wheel jacobian (rad/s per [vx, vy, wz]):\n", np.round(wheel_jacobian(p), 3))
 
 

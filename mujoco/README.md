@@ -5,6 +5,7 @@ pip install mujoco numpy          # + xacro for import_repo_urdf.py
 python omni_mjcf.py               # writes vsss_omni4.xml (placeholder 75 mm, 4-wheel VSSS robot)
 python test_drive.py              # drives it through the wheel Jacobian and checks what it does
 python test_drive.py --rows 1 --rollers_per_row 10 --roller_radius 0.003   # any parameter can be overridden
+python test_drive.py --roller_shape peanut --rows 1 --rollers_per_row 6 --roller_radius 0.0035
 python -m mujoco.viewer --mjcf=vsss_omni4.xml
 ```
 
@@ -27,8 +28,10 @@ chassis (free body)
 By default the rollers are ellipsoids whose length is tuned so the wheel's rolling radius stays
 within about 0.1 mm of `wheel_radius`. Ellipsoid–plane contact is analytic and smooth; a coarse
 faceted mesh roller caused fake vibration at speed. `--roller_shape mesh` gives the exact barrel
-profile with blunt ends. Roller length is always capped so rollers in the same row keep
-`roller_end_gap` between them, or you can set it with `roller_half_length`.
+profile with blunt ends. `--roller_shape peanut` gives figure-8 rollers, two lobes on one axle
+that touch the floor instead of the waist. Roller length is always capped so rollers in the same
+row keep `roller_end_gap` between them, or you can set it with `roller_half_length`
+(`lobe_offset` / `lobe_half_length` for peanuts).
 
 Kinematics, for wheel i at angle θ_i, distance R (centre to wheel mid-plane) and rolling radius r:
 
@@ -48,6 +51,8 @@ The defaults are placeholders. Measure or look up the following:
 - `wheel_radius`, `wheel_R`, `heading_offset_deg` (−45 = X layout, 0 = + layout)
 - `rows`, `rollers_per_row`, `roller_radius`, `row_spacing`, `roller_half_length`,
   `roller_end_gap` (from the wheel you buy or print; `rows 1` for thin single-row wheels)
+- peanut rollers: `roller_radius` = lobe radius, `lobe_offset` = roller middle to lobe centre,
+  `lobe_half_length` = lobe semi-length along the axle (0 = round lobes)
 - `body_mass`, `com_height`, `hub_mass`, `roller_mass`
 - motor, measured at the wheel after the gearbox: `stall_torque`, `no_load_speed`,
   `nominal_voltage`, `wheel_armature` (rotor inertia × gear²)
@@ -87,6 +92,25 @@ wheel has real dips at the gaps. Example: a 32 mm wheel with 10 rollers of Ø6 m
   rubber and chassis compliance). Tune it until the sim matches what the real robot does.
 - The roller end shape matters here, so your real roller profile is better than either
   approximation.
+
+### Peanut / spool rollers
+
+For hourglass rollers whose rounded end rims touch the floor and whose concave waist doesn't.
+Each roller is modelled as its two rims, flattened ellipsoids of radius `roller_radius` and
+thickness `2 * lobe_half_length` (default `0.5 * roller_radius`), on one passive axle. The rim tips sit on
+the rolling circle, and by default the 2n rims of a row are spaced evenly around the wheel. The
+waist never touches, so it's left out. A spool is not convex; if you import one as a single mesh,
+MuJoCo fills in the waist and the middle touches the floor. So keep it as two convex pieces.
+
+Example: a 6-roller single-row wheel, Ø32 mm, with proportions measured from a photo of a real design
+(`--roller_shape peanut --rows 1 --rollers_per_row 6 --roller_radius 0.00314`):
+
+- geometry: roller 9.8 mm long, contact rims at ±15° (12 per revolution, the "dodecagon"),
+  rolling radius 15.33–16.01 mm, effective radius 15.83 mm (98.9 % of the max)
+- tracking with the max radius in the Jacobian: 97.8–99.3 %, which matches r_eff/r. Use
+  `r_eff` (printed by `omni_mjcf.py` / `test_drive.py`) or a measured value as `r` in the kinematics.
+- vertical vibration at 0.5–1.3 m/s: 0.85–1.1 g rms, airborne 8–25 % of the time with
+  `contact_timeconst 0.01`; 0.4–0.8 g rms, airborne ≤ 4 % with `0.02`. Calibrate against the real robot.
 
 ## Notes
 

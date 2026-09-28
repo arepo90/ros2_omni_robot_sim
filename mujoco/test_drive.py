@@ -12,7 +12,7 @@ from dataclasses import fields
 import mujoco
 import numpy as np
 
-from omni_mjcf import OmniParams, build_mjcf, roller_half_length, wheel_jacobian
+from omni_mjcf import OmniParams, build_mjcf, describe_rollers, roller_geometry, wheel_jacobian
 
 
 def yaw_of(q):
@@ -88,8 +88,9 @@ def main():
     m = mujoco.MjModel.from_xml_string(xml)
     d = mujoco.MjData(m)
     mass = m.body_subtreemass[1]
-    a_r, lo, hi, _ = roller_half_length(p)
-    print(f"wheel: {p.rows}x{p.rollers_per_row} {p.roller_shape} rollers, rolling radius {lo*1e3:.3f}..{hi*1e3:.3f} mm")
+    g = roller_geometry(p)
+    print("wheel:", describe_rollers(p, g))
+    print(f"  expected translation tracking with nominal r: r_eff / r = {g.r_eff/p.wheel_radius*100:.1f}%")
     print(f"model: {m.nbody-1} bodies, {m.njnt} joints, {m.nu} motors, mass {mass*1e3:.0f} g, dt {m.opt.timestep*1e3:g} ms")
     settle(m, d, 0.5)
     print(f"  rest height of axle {d.qpos[2]*1e3:.2f} mm (ideal {p.wheel_radius*1e3:.2f}), "
