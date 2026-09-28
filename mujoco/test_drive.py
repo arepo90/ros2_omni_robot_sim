@@ -157,7 +157,8 @@ def main():
     mass = m.body_subtreemass[1]
     g = roller_geometry(p)
     print("wheel:", describe_rollers(p, g))
-    print(f"  expected translation tracking with nominal r: r_eff / r = {g.r_eff/p.wheel_radius*100:.1f}%")
+    r_kin = p.kinematic_radius or p.wheel_radius
+    print(f"  kinematics use r = {r_kin*1e3:.2f} mm; geometric r_eff / r = {g.r_eff/r_kin*100:.1f}%")
     print(f"model: {m.nbody-1} bodies, {m.njnt} joints, {m.nu} motors ({p.motor}), mass {mass*1e3:.0f} g, "
           f"dt {m.opt.timestep*1e3:g} ms")
     settle(m, d, 0.5)

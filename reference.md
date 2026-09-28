@@ -41,10 +41,12 @@ Given by the owner (measured or from datasheets), with derived values in the mod
 | wheel | single plate, 6 rollers in one row; whole wheel inside Ø34.5 mm, hub inside Ø31.4 mm (PLA) | `wheel_radius 0.01725`, `hub_radius 0.0157` |
 | rollers | spool / hourglass shape: 9.8 mm long, Ø6.7 mm at the ends, Ø5 mm in the middle; the end rims touch the floor, not the waist; cast silicone, a bit softer than Shore A40 | `roller_shape peanut`, `rows 1`, `rollers_per_row 6`, `roller_radius 0.00335`, `lobe_half_length 0.00128` |
 | motors | 4× GA12-N20 12 V 381 rpm, long version with a 90° worm output; stall 700 mA / 235 gf·cm, no-load 30 mA; rated torque 71 gf·cm | `motor worm`, `nominal_voltage 12`, `no_load_speed 39.9`, `stall_torque 0.0230`, `wheel_frictionloss 0.001` (from I₀/I_stall) |
-| gearbox | worm, assumed self-locking (not yet confirmed by a hand-turn test) | `backdrive_efficiency 0` |
+| gearbox | worm, self-locking (confirmed: a wheel won't turn by hand) | `backdrive_efficiency 0` |
+| motor driver | 2× TB6612FNG. Usual wiring (IN1/IN2 direction, PWM pin) short-brakes in PWM off-time; duty 0 brakes if the direction pins stay set, coasts if IN1 = IN2 = low (firmware's choice) | `pwm_decay brake`, `stop_mode brake` / `coast` |
 | battery | 3S LiPo 2000 mAh | `supply_voltage 11.1` (12.6 full, ~10.5 empty) |
 | control | plain PWM; no encoders, no current sensing; firmware uses accel/decel ramps | commands are duty cycles |
-| field | painted MDF | `friction 1.0` (placeholder) |
+| field | painted MDF, rollers "pretty grippy" | `friction 1.0` (estimate: 0.8–1.2 typical; never tipping implies < ~1.36) |
+| rolling radius for commands | not measured | `kinematic_radius 0.0169` (17.06 mm geometric minus ~1/3 of the ~0.35 mm squash) |
 
 Owner's observation: before ramps, sudden starts and stops lifted one side of the robot by "a couple
 of mm", and it never came close to tipping. Ramps fixed it. This was used to pick `com_height` and
@@ -151,17 +153,17 @@ Each decision was tested; see `mujoco/README.md` for numbers.
 
 - **Top speed:** 0.76 m/s along a body axis at 11.1 V full duty. Scale by battery voltage, which
   runs 10.5–12.6 V over a charge (about ±7 %).
-- **Open-loop duty feed-forward:** gives ~80 % of the commanded speed (gearbox friction, rolling
+- **Open-loop duty feed-forward:** gives ~81–82 % of the commanded speed (gearbox friction, rolling
   losses over the 12 contacts, scrub between locked worms). Speed control must close the loop
   through the camera, or the feed-forward must be calibrated.
 - **Traction limits** (X layout): ≈ 0.71·μ·g along the body axes and 0.5·μ·g along the diagonals.
   The motors (stall 0.023 N·m) exceed this at low speed, so full-duty starts spin the wheels a little.
 - **Stops and pitch:**
-  - sudden stop from full speed in brake mode: ~35 mm, ~10° pitch (~8 mm side lift);
-  - 200 ms ramp: ~2 mm lift;
-  - coast mode: rolls ~20 cm with ~1 mm lift.
-  - The owner saw "a couple of mm" without ramps, which falls between brake and coast. Unknowns:
-    driver decay mode and rotor inertia.
+  - sudden stop from full speed with `stop_mode brake`: ~35 mm, ~10° pitch (~8 mm side lift);
+  - with `stop_mode coast`: rolls ~19 cm with ~1 mm lift;
+  - 200 ms ramp (either mode, since the TB6612 brakes in PWM off-time): ~2 mm lift.
+  - The owner saw "a couple of mm" without ramps, which falls between the two; rotor inertia is
+    the main unknown, plus which stop mode the firmware used.
 - **Being pushed:** the unpowered robot resists 1.70 N along a body axis and 1.32 N along a
   diagonal (predictions 1.60 / 1.13 N at μ = 1). Pushed robots skid rather than roll.
 - **Vibration:** peaks around 0.4–0.5 m/s at 0.5–1.3 g rms, depending on contact softness.
@@ -172,11 +174,13 @@ Each decision was tested; see `mujoco/README.md` for numbers.
 
 Values to measure (procedures are in `mujoco/README.md`, "Still placeholders"):
 
-- **Self-locking:** does a wheel turn by hand with the motor unpowered?
-- **`friction`:** incline test, μ = 2·tan θ with the diagonal pointing downhill.
-- **Effective radius:** distance per wheel revolution, from video.
-- **`pwm_decay`:** stop distance from full speed (~4 cm brake, ~20 cm coast), or read it off the
-  motor driver's datasheet and wiring (which driver is used is still unknown).
+- **`friction`:** estimated 1.0; incline test, μ = 2·tan θ with the diagonal pointing downhill.
+- **Kinematic radius:** estimated 16.9 mm; distance per wheel revolution from video. In practice
+  fit the duty → speed map with the overhead camera instead.
+- **`stop_mode`:** which one the firmware uses (brake if IN1/IN2 stay set at duty 0, coast if both
+  go low).
+- **Driver losses:** TB6612FNG on-resistance (roughly 0.5 Ω against ~17 Ω of motor) costs a few
+  percent of voltage; fold it into `supply_voltage` or the feed-forward fit.
 - **`wheel_armature`:** spin-up time of a lifted wheel on video.
 - **`contact_timeconst` / `contact_dampratio`:** IMU vibration against speed.
 - **`com_height`:** balance test.
@@ -218,5 +222,7 @@ Not done yet:
 - `2be0b4d` single-row wheels: roller length capped by neighbours.
 - `d7260bf` spool/peanut rollers, effective rolling radius.
 - `0f656a3` `vsss` preset for the real robot, hub collision, supply voltage.
-- next commit: worm-gear drive model (`drive.py`), elliptic cones + `impratio`, launch/stop/push
+- `c58d59b` worm-gear drive model (`drive.py`), elliptic cones + `impratio`, launch/stop/push
   tests, COM 25 mm, contact 10 ms, this file.
+- next commit: owner's answers (self-locking confirmed, TB6612FNG, friction and radius estimates),
+  `stop_mode`, `kinematic_radius`.

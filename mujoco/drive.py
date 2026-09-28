@@ -36,6 +36,8 @@ class Drive:
         jnt = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"wheel_{i}") for i in range(1, p.n_wheels + 1)]
         self.dof = np.array([m.jnt_dofadr[j] for j in jnt])
         self.qadr = np.array([m.jnt_qposadr[j] for j in jnt])
+        if p.pwm_decay not in ("brake", "coast") or p.stop_mode not in ("brake", "coast"):
+            raise ValueError("pwm_decay and stop_mode must be 'brake' or 'coast'")
         if p.motor == "worm" and p.coupling_kv * m.opt.timestep > p.wheel_armature:
             raise ValueError(f"coupling_kv must be <= wheel_armature / timestep = {p.wheel_armature/m.opt.timestep:.3g} "
                              "for the explicit motor-gear coupling to be stable")
@@ -79,9 +81,13 @@ class Drive:
         flank = np.sign(over)
         driving = (flank != 0) & np.where(moving, flank == np.sign(w), flank == np.sign(tau_v))
         load = np.where(driving, F, p.backdrive_efficiency * F)  # the force MuJoCo actually applied
-        if p.pwm_decay == "coast":  # driver disconnects the motor in PWM off-time: it can push, never brake
-            conducting = (duty != 0) & (np.sign(tau_v - b * w) == np.sign(duty))
-            tau_v, b = np.where(conducting, tau_v, 0.0), np.where(conducting, b, 0.0)
+        # a disconnected motor produces no torque at all, not even back-EMF braking
+        off = np.zeros(duty.shape, dtype=bool)
+        if p.pwm_decay == "coast":  # motor disconnected in PWM off-time: it can push, never brake
+            off |= (duty == 0) | (np.sign(tau_v - b * w) != np.sign(duty))
+        if p.stop_mode == "coast":  # duty 0 switches the driver outputs off
+            off |= duty == 0
+        tau_v, b = np.where(off, 0.0, tau_v), np.where(off, 0.0, b)
         net = tau_v - b * w - load
         fdir = np.where(moving, np.sign(w), np.sign(net))
         # back-EMF implicit, gear load explicit (stable for coupling_kv * dt <= wheel_armature)

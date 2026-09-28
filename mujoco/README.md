@@ -26,10 +26,11 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 | 6 silicone (≤ Shore A40) spool rollers, 9.8 mm long, Ø6.7 mm ends, Ø5 mm waist | `roller_shape peanut`, `rows 1`, `rollers_per_row 6`, `roller_radius 0.00335`, `lobe_half_length 0.00128` |
 | 230 g total, battery and motors at the bottom | `body_mass 0.214` (+ ~4 g per wheel, estimated), `com_height 0.025` |
 | 4x GA12-N20 worm gearmotor, 12 V: 381 rpm, stall 235 gf·cm / 700 mA, no-load 30 mA | `motor worm`, `nominal_voltage 12`, `no_load_speed 39.9`, `stall_torque 0.0230`, `wheel_frictionloss 0.001` |
-| self-locking worm gear | `backdrive_efficiency 0` |
+| self-locking worm gear (confirmed: a wheel won't turn by hand) | `backdrive_efficiency 0` |
 | 3S LiPo | `supply_voltage 11.1` (12.6 full, ~10.5 empty) |
-| plain PWM, no encoders or current sensing | commands are duty cycles in [-1, 1] (`drive.Drive`) |
-| painted MDF field | `friction 1.0` (placeholder) |
+| 2× TB6612FNG, plain PWM, no encoders or current sensing | commands are duty cycles in [-1, 1] (`drive.Drive`); `pwm_decay brake`, `stop_mode brake` or `coast` |
+| painted MDF field, "pretty grippy" | `friction 1.0` (estimate) |
+| rolling radius to use in the kinematics | `kinematic_radius 0.0169` (estimate) |
 
 Derived geometry: contact rims at ±15°, rolling radius 16.49–17.27 mm, **effective radius
 17.06 mm**. The waist stays 0.85 mm and the hub 0.79 mm off the floor. A Hertz estimate for
@@ -43,7 +44,9 @@ the linear curve τ = τ_stall·(u·V/V_nom) − (τ_stall/ω₀)·ω, with Coul
 deadband. When the motor drives the wheel, it feels the load. When the wheel would drive the motor
 (braking, being pushed, coasting), the worm locks: the wheel is held to the motor's speed, and the
 motor feels nothing (`backdrive_efficiency 0`). `pwm_decay` picks what the driver does in PWM
-off-time: `brake` (motor shorted, the default here) or `coast`. Step it with
+off-time: `brake` (motor shorted) or `coast`. `stop_mode` picks what duty 0 does. With the TB6612FNG
+driven the usual way (IN1/IN2 set the direction, PWM on the PWM pin), the off-time is a short brake.
+A zero command brakes if the direction pins stay set, and coasts if the firmware sets IN1 = IN2 = low. Step it with
 `Drive(m, p).step(d, duty)` instead of `mj_step`. `gear_backlash` exists but is experimental: the
 free play lets the robot rock on its 12 contacts, and flank impacts clunk harder than real gears.
 
@@ -51,11 +54,12 @@ free play lets the robot rock on its 12 contacts, and flank impacts clunk harder
 
 | test | result |
 |---|---|
-| open-loop duty from the no-load curve, 0.5 m/s along x / y | 80 % of commanded (gearbox friction ~8 %, rolling losses over the 12 contacts ~10 %, the rest scrub) |
-| spin 6 rad/s / arc | 72 % / 69–89 % |
+| open-loop duty from the no-load curve, 0.5 m/s along x / y | 81–82 % of commanded (gearbox friction ~8 %, rolling losses over the 12 contacts ~10 %) |
+| spin 6 rad/s / arc | 74 % / 70–91 % |
 | full duty along x | 0.76 m/s, 0→90 % in 138 ms, peak 9 m/s², 3° pitch |
-| sudden stop from 0.76 m/s (brake) | stops in 35 mm, ~10° pitch (~8 mm side lift) |
-| same with a 200 ms ramp | 55 mm, ~2° (~2 mm lift); `coast` instead: ~20 cm, ~1 mm |
+| sudden stop from 0.76 m/s, `stop_mode brake` | stops in 35 mm, ~10° pitch (~8 mm side lift) |
+| sudden stop, `stop_mode coast` | rolls ~19 cm, ~1° (~1 mm lift) |
+| 200 ms ramp (either stop mode) | 55 mm, ~2° (~2 mm lift) |
 | push the unpowered robot until it slides | 1.70 N along x, 1.32 N along a diagonal |
 
 Pushing checks the friction anisotropy. With the wheels locked, each wheel resists only along its
@@ -68,15 +72,16 @@ Vibration peaks around 0.4–0.5 m/s, where the 12 contacts per wheel revolution
 close to the rims' bounce. It's 0.5–1.3 g rms depending on contact softness; compare with the IMU.
 The hub never touched the floor in these runs.
 
-### Still placeholders, and how to measure them
+### Estimates, and how to measure them
 
-- **Effective radius:** distance per wheel revolution, from video of a marked wheel over a known
-  distance.
-- **`friction`:** put the unpowered robot on a tilted MDF board, diagonal pointing downhill, and
-  find the angle θ where it slides. Then μ = 2·tan θ (along a body axis: μ = √2·tan θ). This only
-  works because the worms lock. If a wheel turns by hand unpowered, they don't.
-- **`pwm_decay`:** stop distance after a sudden stop from full speed: ~4 cm means brake, ~20 cm
-  means coast.
+- **`kinematic_radius` (16.9 mm):** the geometric 17.06 mm minus about a third of the ~0.35 mm
+  silicone squash. Measure distance per wheel revolution from video of a marked wheel. Without
+  encoders, what matters in practice is the duty → speed map: with the camera working, drive
+  constant duties and fit speed against duty (this lumps radius, friction, deadband and voltage).
+- **`friction` (1.0):** soft silicone on painted MDF is usually ~0.8–1.2; randomize 0.7–1.3 until
+  measured. The robot never tipping on hard stops implies μ < ~1.36 at a 25 mm COM. To measure,
+  put the unpowered robot on a tilted MDF board, diagonal pointing downhill, and find the angle θ
+  where it slides: μ = 2·tan θ (along a body axis: μ = √2·tan θ). This works because the worms lock.
 - **`wheel_armature` (rotor inertia):** spin-up time of a lifted wheel at full duty, filmed.
   τ ≈ J·ω₀/τ_stall ≈ 35 ms for the current guess.
 - **`contact_timeconst` / `contact_dampratio`:** IMU vibration against speed.

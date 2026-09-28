@@ -46,7 +46,8 @@ class OmniParams:
     body_mass: float = 0.150  # everything except wheels [kg]
     com_height: float = 0.020  # chassis centre of mass above the floor [m] (battery low = small)
     # --- omni wheel ----------------------------------------------------------------
-    wheel_radius: float = 0.016  # rolling radius (the r in the kinematics) [m]
+    wheel_radius: float = 0.016  # outer rolling radius of the wheel geometry [m]
+    kinematic_radius: float = 0.0  # r used in the wheel Jacobian (firmware / env); 0 = wheel_radius [m]
     roller_shape: str = "ellipsoid"  # "ellipsoid" (smooth, fast), "mesh" (exact barrel, faceted), "peanut" (spool: 2 rims)
     rows: int = 2  # roller rows per wheel (1 or 2)
     rollers_per_row: int = 3
@@ -81,6 +82,7 @@ class OmniParams:
     coupling_kv: float = 0.02  # worm: damping of the gear contact [N m / (rad/s)] (stiffness = 200/s x this)
     gear_backlash: float = 0.0  # worm: total play at the wheel [rad] (experimental: rattles, clunks)
     pwm_decay: str = "brake"  # worm: motor driver in PWM off-time: "brake" (shorted, slow decay) or "coast"
+    stop_mode: str = "brake"  # worm: what duty 0 does: "brake" (shorted) or "coast" (driver outputs off)
     # --- simulation ------------------------------------------------------------
     timestep: float = 0.0005
     impratio: float = 10.0  # friction-to-normal impedance ratio; > 1 stops soft friction from creeping
@@ -95,17 +97,19 @@ PRESETS = {
         body_size=0.075, body_mass=0.214,  # 230 g total minus ~4 g per wheel
         com_height=0.025,  # battery + motors at the bottom; 25 mm matches "a side lifts a few mm, never tips"
         wheel_radius=0.01725, roller_shape="peanut", rows=1, rollers_per_row=6,  # wheel fits a 34.5 mm circle
+        kinematic_radius=0.0169,  # estimate: 17.06 mm geometric r_eff minus ~1/3 of the ~0.35 mm silicone squash
         roller_radius=0.00335, lobe_half_length=0.00128,  # 6.7 mm ends; rims sized for a 9.8 mm roller
         hub_radius=0.0157, hub_thickness=0.0034,  # hub fits a 31.4 mm circle
         hub_mass=0.0022, roller_mass=0.0003,  # estimated from PLA / silicone volumes
-        friction=1.0,  # PLACEHOLDER: silicone on painted MDF (calibrate with the incline test)
+        friction=1.0,  # estimate: soft silicone on painted MDF ~0.8-1.2 (never tipping implies < ~1.36)
         contact_timeconst=0.01,  # Hertz estimate says ~5 ms, but that hops far more than the real robot does
-        motor="worm", backdrive_efficiency=0.0,  # plain PWM, self-locking worm gear
+        motor="worm", backdrive_efficiency=0.0,  # plain PWM, worm gear (confirmed self-locking)
         nominal_voltage=12.0, no_load_speed=39.9, stall_torque=0.0230,  # 381 rpm, 235 gf cm at 12 V
         supply_voltage=11.1, max_wheel_speed=36.9,  # 3S LiPo (12.6 full .. ~10.5 empty)
         wheel_frictionloss=0.001,  # no-load / stall current (30 / 700 mA) x stall torque
         wheel_armature=2e-5,  # PLACEHOLDER: N20 rotor inertia x gear ratio^2
-        pwm_decay="brake",  # PLACEHOLDER: depends on the motor driver (stop distance tells: brake ~4 cm, coast ~20 cm)
+        pwm_decay="brake",  # TB6612FNG with PWM on the PWM pin: short brake in the off-time
+        stop_mode="brake",  # duty 0: brake (direction pins kept) or coast (IN1 = IN2 = low); firmware's choice
     ),
 }
 
@@ -139,7 +143,7 @@ def wheel_jacobian(p: OmniParams, R=None, r=None) -> np.ndarray:
     Same matrix as OmniKinematics::init_transform_matrix in src/kinematics.cpp.
     """
     R = p.wheel_R if R is None else R
-    r = p.wheel_radius if r is None else r
+    r = (p.kinematic_radius or p.wheel_radius) if r is None else r
     th = wheel_angles(p)
     return np.stack([-np.sin(th), np.cos(th), np.full_like(th, R)], axis=1) / r
 
