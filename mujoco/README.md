@@ -13,7 +13,8 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 | file | what it is |
 |---|---|
 | `omni_mjcf.py` | Parametric MJCF generator. Any wheel count, layout, size, roller count, motor model. Also has `wheel_jacobian()` / `body_twist()` (same math as `src/kinematics.cpp`). |
-| `test_drive.py` | Open-loop tracking test (vx, vy, diagonal, spin, arc) plus a full-throttle launch test for `--motor dc`. |
+| `drive.py` | `Drive(m, p).step(d, u)`: steps the sim with wheel commands (speeds for `servo`, PWM duty for `dc` / `worm`); holds the worm-gear model. |
+| `test_drive.py` | Open-loop tracking test (vx, vy, diagonal, spin, arc); for `dc` / `worm` also launch, sudden and ramped stop, and push tests. |
 | `import_repo_urdf.py` | 1:1 import of the Gazebo robots (`3w_v2`, `4w`, `5w`, `6w`) for comparison. |
 
 ## The real robot (`--preset vsss`)
@@ -22,38 +23,64 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 |---|---|
 | 7.5 cm base, wheels on the diagonals, centres 34 mm from the base centre | `heading_offset_deg -45`, `wheel_R 0.034` |
 | wheel fits a Ø34.5 mm circle, hub a Ø31.4 mm circle | `wheel_radius 0.01725`, `hub_radius 0.0157` (the hub collides, to catch strikes) |
-| 6 silicone spool rollers, 9.8 mm long, Ø6.7 mm ends, Ø5 mm waist | `roller_shape peanut`, `rows 1`, `rollers_per_row 6`, `roller_radius 0.00335`, `lobe_half_length 0.00128` |
-| 230 g total | `body_mass 0.214` (+ ~4 g per wheel, estimated) |
-| 4x GA12-N20, 12 V, 381 rpm | `nominal_voltage 12`, `no_load_speed 39.9` |
+| 6 silicone (≤ Shore A40) spool rollers, 9.8 mm long, Ø6.7 mm ends, Ø5 mm waist | `roller_shape peanut`, `rows 1`, `rollers_per_row 6`, `roller_radius 0.00335`, `lobe_half_length 0.00128` |
+| 230 g total, battery and motors at the bottom | `body_mass 0.214` (+ ~4 g per wheel, estimated), `com_height 0.025` |
+| 4x GA12-N20 worm gearmotor, 12 V: 381 rpm, stall 235 gf·cm / 700 mA, no-load 30 mA | `motor worm`, `nominal_voltage 12`, `no_load_speed 39.9`, `stall_torque 0.0230`, `wheel_frictionloss 0.001` |
+| self-locking worm gear | `backdrive_efficiency 0` |
+| 3S LiPo | `supply_voltage 11.1` (12.6 full, ~10.5 empty) |
+| plain PWM, no encoders or current sensing | commands are duty cycles in [-1, 1] (`drive.Drive`) |
+| painted MDF field | `friction 1.0` (placeholder) |
 
 Derived geometry: contact rims at ±15°, rolling radius 16.49–17.27 mm, **effective radius
-17.06 mm**. The waist stays 0.85 mm and the hub 0.79 mm off the floor. Silicone around A30–35
-should squash about 0.35 mm per rim under the robot's weight (Hertz estimate), so the hub margin is
-small. It also gives a ~33 Hz vertical bounce, hence `contact_timeconst 0.005`.
+17.06 mm**. The waist stays 0.85 mm and the hub 0.79 mm off the floor. A Hertz estimate for
+A30–35 silicone gives ~0.35 mm squash per rim and a ~33 Hz vertical bounce (`contact_timeconst`
+~5 ms). That made the simulated robot hop far more than the real one does, so the preset uses 10 ms.
 
-Results: open-loop tracking 97–100 % (the effective radius predicts 98.9 %), top speed 0.92 m/s
-at 12 V, full-throttle launch traction-limited (wheelspin) with the placeholder torque.
+### The worm drive (`motor worm`, `drive.py`)
 
-Vibration is predicted to peak around 0.4–0.5 m/s. There the 12 contacts per wheel revolution
-pass at ~40 Hz, close to the ~33 Hz bounce of the silicone rims:
+A plain-PWM DC motor behind a self-locking worm gear. The motor has its own speed state and follows
+the linear curve τ = τ_stall·(u·V/V_nom) − (τ_stall/ω₀)·ω, with Coulomb friction giving a ~5 % duty
+deadband. When the motor drives the wheel, it feels the load. When the wheel would drive the motor
+(braking, being pushed, coasting), the worm locks: the wheel is held to the motor's speed, and the
+motor feels nothing (`backdrive_efficiency 0`). `pwm_decay` picks what the driver does in PWM
+off-time: `brake` (motor shorted, the default here) or `coast`. Step it with
+`Drive(m, p).step(d, duty)` instead of `mj_step`. `gear_backlash` exists but is experimental: the
+free play lets the robot rock on its 12 contacts, and flank impacts clunk harder than real gears.
 
-| speed | vertical vibration | airborne | with `contact_timeconst 0.01` |
-|---|---|---|---|
-| 0.3 m/s | 0.67 g rms | 3 % | 0.54 g, 3 % |
-| 0.5 m/s | 1.25 g rms | 29 % | 0.75 g, 2 % |
-| 0.8 m/s | 1.26 g rms | 22 % | 0.87 g, 6 % |
+### Results (`python test_drive.py --preset vsss`)
 
-`contact_dampratio 0.5` roughly doubles the airborne time. The hub never touched the floor in these
-runs, but the simulated contact barely squashes, so the real margin is smaller.
+| test | result |
+|---|---|
+| open-loop duty from the no-load curve, 0.5 m/s along x / y | 80 % of commanded (gearbox friction ~8 %, rolling losses over the 12 contacts ~10 %, the rest scrub) |
+| spin 6 rad/s / arc | 72 % / 69–89 % |
+| full duty along x | 0.76 m/s, 0→90 % in 138 ms, peak 9 m/s², 3° pitch |
+| sudden stop from 0.76 m/s (brake) | stops in 35 mm, ~10° pitch (~8 mm side lift) |
+| same with a 200 ms ramp | 55 mm, ~2° (~2 mm lift); `coast` instead: ~20 cm, ~1 mm |
+| push the unpowered robot until it slides | 1.70 N along x, 1.32 N along a diagonal |
 
-Still placeholders: `stall_torque`, `wheel_armature`, `com_height`, `friction`, `supply_voltage`.
-To calibrate on the real robot:
+Pushing checks the friction anisotropy. With the wheels locked, each wheel resists only along its
+drive direction (its rollers roll freely along the axle). That predicts 0.707·μ·m·g = 1.60 N along
+the body axes and 0.5·μ·m·g = 1.13 N along the diagonals, where two wheels just roll. The same
+holds for traction: an X-layout robot accelerates at most at ~0.71·μ·g along its axes and ~0.5·μ·g
+along diagonals.
 
-- **Effective radius:** measure distance per wheel revolution. MuJoCo's soft contact sinks only
-  ~0.03 mm at rest, not the ~0.35 mm the silicone does, so the ~2 % radius loss from squash must
-  come from this measurement.
-- **Contact softness:** compare vibration against the robot's IMU and tune `contact_timeconst` /
-  `contact_dampratio`.
+Vibration peaks around 0.4–0.5 m/s, where the 12 contacts per wheel revolution come at ~40 Hz,
+close to the rims' bounce. It's 0.5–1.3 g rms depending on contact softness; compare with the IMU.
+The hub never touched the floor in these runs.
+
+### Still placeholders, and how to measure them
+
+- **Effective radius:** distance per wheel revolution, from video of a marked wheel over a known
+  distance.
+- **`friction`:** put the unpowered robot on a tilted MDF board, diagonal pointing downhill, and
+  find the angle θ where it slides. Then μ = 2·tan θ (along a body axis: μ = √2·tan θ). This only
+  works because the worms lock. If a wheel turns by hand unpowered, they don't.
+- **`pwm_decay`:** stop distance after a sudden stop from full speed: ~4 cm means brake, ~20 cm
+  means coast.
+- **`wheel_armature` (rotor inertia):** spin-up time of a lifted wheel at full duty, filmed.
+  τ ≈ J·ω₀/τ_stall ≈ 35 ms for the current guess.
+- **`contact_timeconst` / `contact_dampratio`:** IMU vibration against speed.
+- **`com_height`:** balance the robot on an edge.
 
 ## How the wheel model works
 
@@ -104,12 +131,16 @@ linear DC motor, τ = (τ_stall/V)·u − (τ_stall/ω₀)·ω, which exposes to
 
 ## Validation (defaults)
 
+The numbers from here down were measured before the switch to elliptic friction cones
+(see Notes). The generic servo results were re-checked afterwards and are unchanged; sim speed
+dropped to ~8× real time.
+
 | test | servo | dc (open-loop voltage) |
 |---|---|---|
 | vx / vy / diagonal tracking | 100 % | 99.6–99.9 % |
 | spin 6 rad/s | 99.9 % | 99.6 % |
 | arc (0.3 m/s + 3 rad/s) | 100 % | 99–100 % |
-| speed | ~15× real time | ~15× real time |
+| speed | ~15× real time (now ~8×) | ~15× real time (now ~8×) |
 
 A full-throttle launch with the placeholder DC motors is traction-limited. The motors can push
 about 11× more force than friction allows (μ·m·g ≈ 1.5 N). The wheels spin, encoder odometry is off by more than 1 m/s,
@@ -154,6 +185,11 @@ Example: a 6-roller single-row wheel, Ø32 mm, with proportions measured from a 
 
 ## Notes
 
+- Friction uses elliptic cones with `impratio 10`. MuJoCo's default pyramidal cone caps friction at
+  μ/√2 along the diagonals of the contact frame, which is exactly where X-layout wheels slip.
+  `impratio` > 1 stops soft friction from creeping under steady sideways loads.
+- For `motor worm`, `coupling_kv` must stay ≤ `wheel_armature / timestep` (checked), and
+  `contact_timeconst` ≥ 2 × `timestep`.
 - Robot geoms only collide with the floor (and other robots' chassis). Gazebo's `selfCollide`
   on rollers is not reproduced.
 - The repo's collision meshes can't be reused as-is. MuJoCo convex-hulls meshes, and the

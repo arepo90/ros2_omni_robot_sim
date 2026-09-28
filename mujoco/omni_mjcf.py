@@ -66,7 +66,8 @@ class OmniParams:
     contact_timeconst: float = 0.01  # roller contact softness [s] (>= 2*timestep); ~1/(vertical bounce freq in rad/s)
     contact_dampratio: float = 1.0  # roller contact damping ratio (rubber: < 1 is bouncier)
     # --- motor ---------------------------------------------------------------------
-    motor: str = "servo"  # "servo": ideal-ish speed loop (like the Gazebo sim); "dc": voltage-driven DC motor
+    motor: str = "servo"  # "servo": ideal-ish speed loop (like the Gazebo sim); "dc": PWM-driven DC motor;
+    #                       "worm": PWM-driven DC motor behind a worm gear (step it with drive.Drive)
     servo_kv: float = 0.05  # speed-loop gain [N m / (rad/s)]
     max_wheel_speed: float = 60.0  # servo ctrl range [rad/s]
     stall_torque: float = 0.10  # at the wheel (after gearbox) [N m]; also servo torque limit
@@ -74,8 +75,15 @@ class OmniParams:
     nominal_voltage: float = 6.0  # voltage the stall torque / no-load speed are quoted at
     supply_voltage: float = 0.0  # battery voltage the dc motor model is driven with; 0 = nominal_voltage
     wheel_armature: float = 1e-5  # reflected rotor inertia J_rotor * gear^2 [kg m^2]
+    wheel_frictionloss: float = 0.0  # Coulomb friction of motor + gearbox at the wheel [N m] (PWM deadband)
+    backdrive_efficiency: float = 1.0  # worm: share of a wheel-driven load the motor feels; 0 = self-locking
+    worm_lock_torque: float = 0.3  # worm: most torque the locked gear holds before the model gives [N m]
+    coupling_kv: float = 0.02  # worm: damping of the gear contact [N m / (rad/s)] (stiffness = 200/s x this)
+    gear_backlash: float = 0.0  # worm: total play at the wheel [rad] (experimental: rattles, clunks)
+    pwm_decay: str = "brake"  # worm: motor driver in PWM off-time: "brake" (shorted, slow decay) or "coast"
     # --- simulation ------------------------------------------------------------
     timestep: float = 0.0005
+    impratio: float = 10.0  # friction-to-normal impedance ratio; > 1 stops soft friction from creeping
 
 
 PRESETS = {
@@ -85,16 +93,19 @@ PRESETS = {
     "vsss": dict(
         n_wheels=4, heading_offset_deg=-45.0, wheel_R=0.034,  # wheels on the diagonals, 34 mm out
         body_size=0.075, body_mass=0.214,  # 230 g total minus ~4 g per wheel
-        com_height=0.020,  # PLACEHOLDER
+        com_height=0.025,  # battery + motors at the bottom; 25 mm matches "a side lifts a few mm, never tips"
         wheel_radius=0.01725, roller_shape="peanut", rows=1, rollers_per_row=6,  # wheel fits a 34.5 mm circle
         roller_radius=0.00335, lobe_half_length=0.00128,  # 6.7 mm ends; rims sized for a 9.8 mm roller
         hub_radius=0.0157, hub_thickness=0.0034,  # hub fits a 31.4 mm circle
         hub_mass=0.0022, roller_mass=0.0003,  # estimated from PLA / silicone volumes
-        friction=1.0,  # PLACEHOLDER: silicone on the field surface
-        contact_timeconst=0.005,  # Hertz estimate for ~A35 silicone rims: ~0.35 mm squash, ~33 Hz bounce
-        nominal_voltage=12.0, no_load_speed=39.9, max_wheel_speed=39.9,  # 381 rpm at 12 V
-        stall_torque=0.06,  # PLACEHOLDER [N m]: from the listing / a stall test
+        friction=1.0,  # PLACEHOLDER: silicone on painted MDF (calibrate with the incline test)
+        contact_timeconst=0.01,  # Hertz estimate says ~5 ms, but that hops far more than the real robot does
+        motor="worm", backdrive_efficiency=0.0,  # plain PWM, self-locking worm gear
+        nominal_voltage=12.0, no_load_speed=39.9, stall_torque=0.0230,  # 381 rpm, 235 gf cm at 12 V
+        supply_voltage=11.1, max_wheel_speed=36.9,  # 3S LiPo (12.6 full .. ~10.5 empty)
+        wheel_frictionloss=0.001,  # no-load / stall current (30 / 700 mA) x stall torque
         wheel_armature=2e-5,  # PLACEHOLDER: N20 rotor inertia x gear ratio^2
+        pwm_decay="brake",  # PLACEHOLDER: depends on the motor driver (stop distance tells: brake ~4 cm, coast ~20 cm)
     ),
 }
 
@@ -293,8 +304,8 @@ def _roller_mesh(p: OmniParams, half_len, n_s=17, n_phi=32):
 
 
 def build_mjcf(p: OmniParams) -> str:
-    if p.motor not in ("servo", "dc"):
-        raise ValueError("motor must be 'servo' or 'dc'")
+    if p.motor not in ("servo", "dc", "worm"):
+        raise ValueError("motor must be 'servo', 'dc' or 'worm'")
     if p.roller_shape not in ("ellipsoid", "mesh", "peanut"):
         raise ValueError("roller_shape must be 'ellipsoid', 'mesh' or 'peanut'")
     if p.rows not in (1, 2):
@@ -342,6 +353,12 @@ def build_mjcf(p: OmniParams) -> str:
         hub = (f'<geom type="cylinder" size="{d*0.9:.5g} {p.row_spacing/2 + p.roller_radius*0.6:.5g}" '
                f'mass="{p.hub_mass:g}" rgba=".8 .8 .8 1" {visual}/>')
 
+    if p.motor == "worm":  # rotor inertia and gearbox friction live in drive.Drive's motor state
+        wheel_joint = '<joint name="wheel_{i}" axis="0 0 1"/>'
+    else:
+        wheel_joint = (f'<joint name="wheel_{{i}}" axis="0 0 1" armature="{p.wheel_armature:g}" '
+                       f'frictionloss="{p.wheel_frictionloss:g}"/>')
+
     wheels = []
     row_z = [0.0] if p.rows == 1 else [-p.row_spacing / 2, p.row_spacing / 2]
     for i, th in enumerate(wheel_angles(p), start=1):
@@ -361,7 +378,7 @@ def build_mjcf(p: OmniParams) -> str:
                 )
         wheels.append(
             f'<body name="wheel_{i}" pos="{_fmt(pos)}" zaxis="{_fmt(axle)}">'
-            f'<joint name="wheel_{i}" axis="0 0 1" armature="{p.wheel_armature:g}"/>'
+            + wheel_joint.format(i=i)
             + hub
             + "".join(rollers)
             + "</body>"
@@ -375,6 +392,11 @@ def build_mjcf(p: OmniParams) -> str:
                 f'<velocity name="motor_{i}" joint="wheel_{i}" kv="{p.servo_kv:g}" '
                 f'ctrlrange="{-p.max_wheel_speed:g} {p.max_wheel_speed:g}" '
                 f'forcelimited="true" forcerange="{-p.stall_torque:g} {p.stall_torque:g}"/>'
+            )
+        elif p.motor == "worm":  # ctrl = motor speed; drive.Drive decides who drives whom
+            acts.append(
+                f'<velocity name="motor_{i}" joint="wheel_{i}" kv="{p.coupling_kv:g}" '
+                f'forcelimited="true" forcerange="{-p.worm_lock_torque:g} {p.worm_lock_torque:g}"/>'
             )
         else:  # tau = (stall/V) * volts - (stall/no_load) * omega
             acts.append(
@@ -390,7 +412,7 @@ def build_mjcf(p: OmniParams) -> str:
     return f"""<mujoco model="omni{p.n_wheels}">
   <!-- generated by omni_mjcf.py: {', '.join(f'{f.name}={getattr(p, f.name)}' for f in fields(p))} -->
   <compiler angle="radian" autolimits="true"/>
-  <option timestep="{p.timestep:g}" integrator="implicitfast"/>
+  <option timestep="{p.timestep:g}" integrator="implicitfast" cone="elliptic" impratio="{p.impratio:g}"/>
   <default>
     <default class="roller">
       <geom priority="1" friction="{p.friction:g} 0.005 0.0001" solref="{p.contact_timeconst:g} {p.contact_dampratio:g}" rgba=".1 .1 .1 1"/>
