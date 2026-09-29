@@ -8,7 +8,7 @@ overhead camera. A plain rclpy script, no colcon build needed.
   python3 ros_bridge.py --no_viewer           # headless
   python3 ros_bridge.py --model roller        # detailed roller-level robots (slow; 3v3 below real time)
 
-  ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/blue_0/cmd_vel
+  python3 teleop.py                           # keyboard: WASD move, QE turn, only while held
   ros2 run rqt_image_view rqt_image_view /overhead_camera/image_raw
   ros2 topic echo /blue_0/odom
 
@@ -24,6 +24,7 @@ and
   /overhead_camera/camera_info    sensor_msgs/CameraInfo (pinhole; not published with --cam_ortho)
   /tf                             field -> <robot>/base_link; static field -> overhead_camera_optical
   /clock                          sim time
+  /field_truth                    vsss_msgs/Field: ground truth in the vision's format (needs vsss_msgs built)
   /reset                          std_srvs/Empty: robots and ball back to their start poses
 
 cmd_vel -> wheels does what the firmware would: inverse kinematics with kinematic_radius, then the
@@ -59,7 +60,12 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from drive import Drive
 from omni_mjcf import wheel_jacobian
 from planar_robot import PlanarDrive
-from vsss_field import add_scene_args, scene_from_args
+from vsss_field import add_scene_args, camera_option, scene_from_args
+
+try:  # built with `colcon build --base-paths msgs` (see reference.md); the sim runs without it
+    from vsss_msgs.msg import Field, Object
+except ImportError:
+    Field = Object = None
 
 
 class DriveList:
@@ -180,7 +186,7 @@ class Bridge(Node):
     def __init__(self, a):
         super().__init__("vsss_mujoco")
         self.a = a
-        self.scene = scene_from_args(a)
+        self.scene = scene_from_args(a, display_wheels=not a.no_viewer)  # only the viewer shows them
         self.m = self.scene.spec.compile()
         self.d = mujoco.MjData(self.m)
         self.robots = [SimRobot(self, self.m, self.scene, r) for r in self.scene.robots]
@@ -197,9 +203,15 @@ class Bridge(Node):
         self.pub_img = self.create_publisher(Image, "/overhead_camera/image_raw", 2)
         self.pub_info = self.create_publisher(CameraInfo, "/overhead_camera/camera_info", 2)
         self.create_service(Empty, "/reset", self._on_reset)
+        self.pub_truth = self.create_publisher(Field, "/field_truth", 10) if Field else None
+        if Field is None:
+            self.get_logger().warn("vsss_msgs not found (not built or install/setup.bash not sourced): no /field_truth")
+        self.truth_ids = [(r.team, r.index + (1 if r.team == "blue" else 11), self.m.body(f"{r.name}/chassis").id)
+                          for r in self.scene.robots]
 
         cam = self.scene.cam
         self.renderer = mujoco.Renderer(self.m, cam["height"], cam["width"])
+        self.cam_option = camera_option()  # the robots as they are: opaque case, no display wheels
         self.cam_info = None if cam["ortho"] else self._camera_info(cam)
         st = TransformStamped()  # ROS optical frame: x right (= field +x), y down (= field -y), z forward (down)
         st.header.frame_id, st.child_frame_id = "field", "overhead_camera_optical"
@@ -253,10 +265,30 @@ class Bridge(Node):
         _set_pose(od.pose.pose, d.qpos[self.ball_q:self.ball_q + 3], (1.0, 0.0, 0.0, 0.0))
         _set_vec(od.twist.twist.linear, d.qvel[self.ball_v:self.ball_v + 3])
         self.pub_ball.publish(od)
+        if self.pub_truth:
+            self.pub_truth.publish(self._field_truth(stamp))
+
+    def _field_truth(self, stamp):
+        """The state as a perfect vision would report it: pattern ids, field frame, heading of the front."""
+        m, d = self.m, self.d
+        f = Field()
+        f.header.stamp, f.header.frame_id = stamp, "field"
+        bx, by = d.qpos[self.ball_q:self.ball_q + 2]
+        bvx, bvy = d.qvel[self.ball_v:self.ball_v + 2]
+        f.ball = Object(id=0, detected=True, x=float(bx), y=float(by), vx=float(bvx), vy=float(bvy))
+        vel = np.zeros(6)
+        for team, rid, body in self.truth_ids:
+            q = d.xquat[body]
+            mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, body, vel, 0)  # world frame: angular, linear
+            o = Object(id=rid, detected=True, x=float(d.xpos[body][0]), y=float(d.xpos[body][1]),
+                       theta=math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2)),
+                       vx=float(vel[3]), vy=float(vel[4]), w=float(vel[2]))
+            (f.blue if team == "blue" else f.yellow).append(o)
+        return f
 
     def publish_camera(self):
         stamp = _stamp(self.wall0 + self.d.time)
-        self.renderer.update_scene(self.d, camera="overhead")
+        self.renderer.update_scene(self.d, camera="overhead", scene_option=self.cam_option)
         img = self.renderer.render()
         msg = Image(height=img.shape[0], width=img.shape[1], encoding="rgb8", is_bigendian=0, step=img.shape[1] * 3)
         msg.header.stamp, msg.header.frame_id = stamp, "overhead_camera_optical"

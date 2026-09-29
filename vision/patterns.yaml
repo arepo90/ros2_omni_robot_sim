@@ -1,0 +1,41 @@
+# Robot top patterns: the team convention, shared by the sim (mujoco/vsss_field.py paints the robots
+# with it) and the vision (vision/ decodes it). Taken from the old YOLO vision (vsss repo, commit
+# 7490988, vision_general.py) and the team's pattern sheet.
+#
+# Layout on the 7.5 cm top: the team colour covers the rear half; the two ID squares sit side by side
+# on the front half. The robot's heading points from the team patch towards the ID squares. "left"
+# and "right" are the robot's own left and right (seen from above with its front pointing up). On
+# the pattern sheet the robots are drawn with the front pointing down, so the sheet's left square is
+# the robot's right.
+
+colors:  # sRGB of the printed patches, sampled from the pattern sheet
+  darkblue: [5, 11, 159]     # team blue
+  yellow: [255, 230, 13]     # team yellow
+  red: [204, 0, 1]
+  green: [0, 204, 8]
+  lightblue: [0, 170, 206]   # "blue" in the old vision code
+  pink: [205, 23, 220]
+
+teams:  # team -> colour of its team patch; ids 1-10 are the blue team, 11-20 yellow
+  blue: darkblue
+  yellow: yellow
+
+ids:  # [left, right] for ids 1..10 (blue team) and 11..20 (yellow team, same pairs)
+  - [green, red]
+  - [lightblue, red]
+  - [red, green]
+  - [lightblue, green]
+  - [pink, green]
+  - [red, lightblue]
+  - [green, lightblue]
+  - [pink, lightblue]
+  - [green, pink]
+  - [lightblue, pink]
+
+ball: [255, 115, 0]  # orange golf ball, as the sim renders it (mujoco/vsss_field.py BALL_RGBA)
+
+layout:  # [m]
+  top_size: 0.075            # square top
+  border: 0.004              # black rim around the patches and between them
+  gap: 0.004
+  top_height: 0.0705         # patches above the floor (vision corrects the camera parallax with it)

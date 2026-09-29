@@ -41,6 +41,12 @@ from omni_mjcf import OmniParams, build_mjcf, make_params, roller_geometry, whee
 
 _EPS = 1e-3  # [rad/s] below this the motor counts as stopped (as in drive.py)
 G = 9.81
+# Render groups. The MuJoCo viewer shows groups 0-2: a see-through case and the wheels (VIEW_GROUP).
+# A camera that should see the robot as it is renders groups 0, 1 and CAMERA_GROUP instead: the
+# opaque case (the collision box). vsss_field.camera_option() sets that up.
+VIEW_GROUP, CAMERA_GROUP = 2, 3
+SHELL_RGBA = (0.6, 0.6, 0.6, 0.2)  # see-through grey case, viewer only
+HUB_RGBA, RIM_RGBA = (0.92, 0.92, 0.92, 1), (0.95, 0.45, 0.1, 1)  # display colours of the wheels
 
 
 @dataclass
@@ -66,8 +72,9 @@ def mass_properties(p: OmniParams):
     return diag(0), diag(5)  # freejoint: total mass, yaw inertia about the chassis centre
 
 
-def robot_spec(p: OmniParams, q: PlanarParams, rgba=(0.05, 0.05, 0.05, 1)) -> mujoco.MjSpec:
-    """One planar robot as an MjSpec whose root body is "chassis" (attach it with a name prefix)."""
+def robot_spec(p: OmniParams, q: PlanarParams, rgba=(0.05, 0.05, 0.05, 1), display_wheels=True) -> mujoco.MjSpec:
+    """One planar robot as an MjSpec whose root body is "chassis" (attach it with a name prefix).
+    display_wheels adds turning wheels to look at in the viewer (~50 % more time per step)."""
     mass, izz = mass_properties(p)
     N = mass * G / p.n_wheels
     k = p.friction * N / q.slip_speed
@@ -83,12 +90,16 @@ def robot_spec(p: OmniParams, q: PlanarParams, rgba=(0.05, 0.05, 0.05, 1)) -> mu
     body.mass = mass
     body.ipos = [0, 0, p.com_height]
     body.inertia = [izz, izz, izz]  # only yaw matters in the plane
-    body.add_geom(name="chassis", type=mujoco.mjtGeom.mjGEOM_BOX, size=[half, half, (z_top - z_bot) / 2],
-                  pos=[0, 0, (z_top + z_bot) / 2], rgba=rgba, mass=0, contype=4, conaffinity=5)
-    body.add_site(name="imu", pos=[0, 0, p.wheel_radius])
+    box = dict(type=mujoco.mjtGeom.mjGEOM_BOX, size=[half, half, (z_top - z_bot) / 2],
+               pos=[0, 0, (z_top + z_bot) / 2], mass=0)
+    body.add_geom(name="chassis", rgba=rgba, contype=4, conaffinity=5, group=CAMERA_GROUP, **box)
+    body.add_geom(name="shell", rgba=SHELL_RGBA, contype=0, conaffinity=0, group=VIEW_GROUP, **box)
+    body.add_site(name="imu", pos=[0, 0, p.wheel_radius], group=4)
     for i, th in enumerate(wheel_angles(p), start=1):
         c, s = np.cos(th), np.sin(th)
         body.add_site(name=f"contact_{i}", pos=[p.wheel_R * c, p.wheel_R * s, 0], size=[0.002, 0, 0], group=4)
+        if display_wheels:
+            _display_wheel(body, p, i, [p.wheel_R * c, p.wheel_R * s, p.wheel_radius], [-c, -s, 0])
         # traction along the rolling direction t = (-sin, cos): force = k * (ctrl - v_t), ctrl = r * w
         spec.add_actuator(name=f"traction_{i}", trntype=mujoco.mjtTrn.mjTRN_SITE, target=f"contact_{i}",
                           gear=[-s, c, 0, 0, 0, 0], gainprm=[k] + [0] * 9,
@@ -102,6 +113,36 @@ def robot_spec(p: OmniParams, q: PlanarParams, rgba=(0.05, 0.05, 0.05, 1)) -> mu
     spec.add_sensor(name="imu_gyro", type=mujoco.mjtSensor.mjSENS_GYRO, objtype=mujoco.mjtObj.mjOBJ_SITE, objname="imu")
     spec.add_sensor(name="imu_acc", type=mujoco.mjtSensor.mjSENS_ACCELEROMETER, objtype=mujoco.mjtObj.mjOBJ_SITE, objname="imu")
     return spec
+
+
+def _quat_z_to(v):
+    q = np.zeros(4)
+    mujoco.mju_quatZ2Vec(q, np.asarray(v, dtype=float))
+    return q
+
+
+def _display_wheel(chassis, p: OmniParams, i, pos, axle):
+    """A wheel to look at, not to simulate: the hub and roller rims of the roller model on a hinge
+    that PlanarDrive turns to the wheel's angle. No collisions, negligible mass."""
+    wheel = chassis.add_body(name=f"wheel_{i}", pos=pos, quat=_quat_z_to(axle))  # z = axle, inward
+    wheel.explicitinertial = True
+    wheel.mass, wheel.inertia = 1e-5, [1e-9, 1e-9, 1e-9]
+    wheel.add_joint(name=f"wheel_{i}", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, 1], armature=1e-6)
+    vis = dict(contype=0, conaffinity=0, group=VIEW_GROUP, mass=0)
+    g = roller_geometry(p)
+    hub_r = p.hub_radius or 0.9 * g.d
+    wheel.add_geom(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[hub_r, p.hub_thickness / 2, 0], rgba=HUB_RGBA, **vis)
+    rows = [0.0] if p.rows == 1 else [-p.row_spacing / 2, p.row_spacing / 2]
+    lobes = (-g.lobe_offset, g.lobe_offset) if p.roller_shape == "peanut" else (0.0,)
+    for k, z in enumerate(rows):
+        for j in range(p.rollers_per_row):
+            phi = 2 * np.pi * j / p.rollers_per_row + k * np.pi / p.rollers_per_row
+            centre = np.array([g.d * np.cos(phi), g.d * np.sin(phi), z])
+            axis = np.array([-np.sin(phi), np.cos(phi), 0.0])  # roller axle, tangent to the wheel
+            for off in lobes:
+                wheel.add_geom(type=mujoco.mjtGeom.mjGEOM_ELLIPSOID, pos=centre + off * axis,
+                               quat=_quat_z_to(axis), size=[p.roller_radius, p.roller_radius, g.half_len],
+                               rgba=RIM_RGBA, **vis)
 
 
 class PlanarDrive:
@@ -136,6 +177,10 @@ class PlanarDrive:
                               for i in range(1, n + 1)] for pre in prefixes])
         if (self.act < 0).any():
             raise ValueError("model has no planar robots with these prefixes")
+        jnt = np.array([[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"{pre}wheel_{i}")
+                         for i in range(1, n + 1)] for pre in prefixes])
+        self.wheel_q = m.jnt_qposadr[jnt] if (jnt >= 0).all() else None  # display wheels, if any
+        self.wheel_v = m.jnt_dofadr[jnt] if (jnt >= 0).all() else None
         self.r = roller_geometry(p).r_eff  # the wheel rolls on its effective radius
         mass, _ = mass_properties(p)
         self.N = mass * G / n
@@ -155,6 +200,8 @@ class PlanarDrive:
         self.theta = self.theta + self.w * self.m.opt.timestep
         d.ctrl[self.act] = self.r * self.w
         mujoco.mj_step2(self.m, d)  # traction F = clamp(k*(r*w - v_t)), integrate
+        if self.wheel_q is not None:  # turn the display wheels
+            d.qpos[self.wheel_q], d.qvel[self.wheel_v] = self.theta, self.w
 
     def _motor(self, v):
         p, q, r, k = self.p, self.q, self.r, self.k

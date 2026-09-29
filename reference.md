@@ -4,6 +4,122 @@ Context for anyone, human or agent, picking this project up. `README.md` documen
 Gazebo package; `mujoco/README.md` documents how to use the MuJoCo model. This file records the
 goal, the real robot, what was built and why, what was verified, the traps found, and what's open.
 
+## 0. Quickstart
+
+Every command below was run on the owner's laptop (Ubuntu 22.04, ROS 2 Humble), where everything
+is already installed. Use `python3`: Ubuntu 22.04 has no `python`.
+
+**One-time setup** (a fresh Ubuntu 22.04 + ROS 2 Humble machine):
+
+```bash
+git clone https://github.com/arepo90/ros2_omni_robot_sim.git ~/ros2_omni_robot_sim
+cd ~/ros2_omni_robot_sim && git checkout humble
+pip install --user "mujoco==3.14.0" "numpy<2" python-xlib   # numpy < 2: Humble's rclpy and cv_bridge need 1.x
+pip install --user torch==2.8.0 torchvision==0.23.0 ultralytics "numpy<2"   # the vision's YOLO (installed on the laptop)
+sudo apt install ros-humble-teleop-twist-keyboard ros-humble-rqt-image-view ros-humble-rqt-plot
+source /opt/ros/humble/setup.bash && colcon build --base-paths msgs   # vsss_msgs: the /field messages
+echo 'source ~/ros2_omni_robot_sim/install/setup.bash' >> ~/.bashrc
+# the YOLO robot detector from the old vision (vsss repo history; not in git, 52 MB):
+git clone https://github.com/arepo90/vsss.git /tmp/vsss && git -C /tmp/vsss show \
+  '7490988:bullet_ws/install/vision/share/vision/utils/models/yolov8m(v1)/best.pt' > vision/models/robots_yolov8m.pt
+```
+
+Every terminal needs ROS and `install/setup.bash` sourced. On the laptop `~/.bashrc` does both
+(plus `ROS_DOMAIN_ID=20`, `RMW_IMPLEMENTATION=rmw_zenoh_cpp`). Without `vsss_msgs` the sim still
+runs, just without `/field_truth`.
+
+**Demos without ROS** (from the `mujoco/` folder, so the generated `.xml` files stay gitignored):
+
+```bash
+cd ~/ros2_omni_robot_sim/mujoco
+python3 test_drive.py --preset vsss              # roller model checks: tracking, launch, stops, push (~5 s)
+python3 planar_robot.py                          # fast model vs roller model, side by side (~10 s)
+python3 omni_mjcf.py --preset vsss               # writes vsss_omni4.xml: one robot, roller model
+python3 -m mujoco.viewer --mjcf=vsss_omni4.xml   # look at it (the wheel detail; nothing drives it here)
+python3 vsss_field.py --blue 3 --yellow 3        # writes vsss_field.xml: field, ball, 6 robots
+python3 -m mujoco.viewer --mjcf=vsss_field.xml   # look at it (nothing drives the robots here)
+python3 import_repo_urdf.py 4w                   # the original Gazebo 4w robot in MuJoCo (needs ROS sourced)
+```
+
+**The ROS 2 sim**, three terminals:
+
+```bash
+# terminal 1: the sim, ball, overhead camera, 3D viewer. Stop: Ctrl+C or close the viewer. Pick one:
+cd ~/ros2_omni_robot_sim/mujoco
+python3 ros_bridge.py --model roller --blue 1   # full model: real wheels and rollers on contacts (real time up to 3 robots)
+python3 ros_bridge.py                           # fast model (the default): 3 blue robots, 3v3 with --yellow 3
+
+# terminal 2: drive blue_0 with the keyboard; it moves only while keys are held and this terminal has focus
+cd ~/ros2_omni_robot_sim/mujoco
+python3 teleop.py                      # --robot yellow_1 for another robot, --speed / --turn for 100 %
+
+# terminal 3: watch
+ros2 run rqt_image_view rqt_image_view /overhead_camera/image_raw   # the overhead camera
+ros2 run rqt_plot rqt_plot /blue_0/odom/twist/twist/linear/x         # plot any field
+ros2 topic echo /blue_0/odom                                          # ground-truth pose and velocity
+```
+
+Teleop keys (`teleop.py`): `W` / `S` forward / back, `A` / `D` left / right, `Q` / `E` turn counter-clockwise /
+clockwise, `↑` / `↓` speed ±10 %, `Esc` or Ctrl+C quit. Keys combine (W+A diagonal, W+Q arc). 100 % is
+0.8 m/s and 6 rad/s; it starts at 50 %. The robot moves only while a key is held: releasing sends a
+stop at once (a 100 ms tap moves it ~2 cm), and so does switching to another window. It reads the
+physically held keys from X11 (not Wayland). `ros2 run teleop_twist_keyboard teleop_twist_keyboard
+--ros-args -r cmd_vel:=/blue_0/cmd_vel` also works, but its commands stick until the next key.
+
+**Vision** (§9): camera image → `/field`, the global state strategies consume. With the sim running:
+
+```bash
+python3 vision/vision_node.py                                       # sim camera; pose from TF + camera_info
+ros2 run rqt_image_view rqt_image_view /vision/image_annotated      # what it sees: ids, headings, ball
+ros2 topic echo /field                                              # the state (ros2 topic echo /field_truth: the truth)
+python3 vision/vision_eval.py                                       # accuracy vs the sim's truth, every 10 s
+# a real camera: click 6 line points once (camera fixed), then run on its topic
+python3 vision/calibrate.py --device 2 --camera_height 1.95 --colors -o vision/calib/real.yaml
+python3 vision/vision_node.py --calib vision/calib/real.yaml --image /camera/image_raw
+```
+
+Without teleop, from any terminal:
+
+```bash
+ros2 topic pub --once /blue_0/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3}}"   # drive; holds until the next command
+ros2 topic pub --once /blue_0/cmd_vel geometry_msgs/msg/Twist "{}"                    # stop
+ros2 service call /reset std_srvs/srv/Empty                                           # robots and ball back to the start
+```
+
+Useful `ros_bridge.py` options (`python3 ros_bridge.py -h` lists them all):
+
+| option | effect |
+|---|---|
+| `--blue 3 --yellow 3` | robots per team, 0–5 (`blue_0`…, `yellow_0`…) |
+| `--no_viewer` | headless: no 3D window, topics and camera still run |
+| `--model roller` | the full roller-level model (real time for 1–3 robots; 3v3 runs at ~0.8×) |
+| `--cam_ortho` | flat, parallax-free camera instead of a pinhole at 2 m |
+| `--cmd_timeout 0.5` | stop a robot 0.5 s after its last command (default: hold) |
+| `--ff_gain 1.2` | scale the open-loop duty: robots reach only ~80 % of the command |
+
+Two robot models, same topics and controls. **roller** is the full simulation: every roller is a
+body on its own axle touching the floor, driven through the worm-gear model (`drive.py`); it has
+pitch, bounce and vibration, and is the reference. **planar** (default) is a box pushed by one
+traction force per wheel with the same motor and self-locking behaviour, fitted to the roller
+model's steady-state driving (§5.8); ~20× real time for a full field, for 3v3 and future RL.
+
+In the 3D viewer the cases are see-through grey so the wheels show (the planar model's wheels are
+for display only, turning with its wheel speed; they're left out without a viewer). The overhead
+camera still sees opaque black cases like the real robots. Double-click a robot or the ball, then
+Ctrl + right-drag to push it. All topics are listed in `mujoco/README.md`.
+
+If something is off:
+
+- **`ros2 topic list` shows only `/rosout` and `/parameter_events`:** the sim isn't running, or the
+  Zenoh router is down (`systemctl status rmw-zenoh-router`; it's a system service and must stay
+  on, since `RMW_IMPLEMENTATION=rmw_zenoh_cpp` needs it for discovery).
+- **The robot ignores teleop:** click the teleop terminal (its status line says "not focused"
+  otherwise) and check the robot name (`ros2 topic echo /blue_0/cmd_vel` prints while you hold keys).
+- **Robots are slower than commanded:** expected. The duty is open loop, like the real firmware.
+- **The RoboCorea services** (`camera-streamer`, `esp32-bridge`, `robot-manager`, `map-manager`,
+  `c920-stream`) are disabled so the ROS graph only holds the sim. To bring them back:
+  `systemctl --user enable --now camera-streamer esp32-bridge robot-manager map-manager c920-stream`.
+
 ## 1. Goal
 
 The owner is building a fleet of 4-wheel omnidirectional robots for **IEEE VSSS** (Very Small Size
@@ -70,17 +186,20 @@ mujoco/test_drive.py        validation: tracking, launch, sudden/ramped stop, pu
 mujoco/planar_robot.py      fast planar robot (box + one traction force per wheel) + side-by-side test
 mujoco/vsss_field.py        VSSS field (walls, goals, lines), ball, N robots (planar/roller), camera, via MjSpec
 mujoco/ros_bridge.py        rclpy bridge: <robot>/cmd_vel in; odom, imu, wheels, duty, camera, tf, clock out
+mujoco/teleop.py            terminal keyboard teleop (WASD/QE, hold to move) for one robot's cmd_vel
+msgs/vsss_msgs/             Field / Object messages: the global state (/field, /field_truth); colcon build
+vision/patterns.yaml        robot top patterns (colours, id table, layout): shared by the sim and the vision
+vision/vision_node.py       camera -> /field: YOLO + colour patches + Kalman filters (camera, detect, track .py)
+vision/calibrate.py         real camera: click 6 field line points (+ patch colours) -> calibration YAML
+vision/vision_eval.py       scores /field against the sim's /field_truth
 mujoco/import_repo_urdf.py  1:1 import of the Gazebo URDFs into MuJoCo (needs `pip install xacro`)
 mujoco/README.md            usage and parameter documentation
 ```
 
-Setup: clone the repo and `git checkout humble`, then `pip install mujoco numpy` (and `xacro` for
-the importer). Run `python mujoco/test_drive.py --preset vsss` and view with
-`python -m mujoco.viewer --mjcf=vsss_omni4.xml` after `python mujoco/omni_mjcf.py --preset vsss`.
-Tested with Python 3.11, MuJoCo 3.14.0, NumPy 2.4. Also on Ubuntu 22.04 / ROS 2 Humble with the
-system Python 3.10 and NumPy 1.26 (Humble's rclpy and cv_bridge need NumPy < 2): identical results.
-The Gazebo part needs ROS 2 Humble, Gazebo Fortress, `install_dependency.sh`, and `colcon build`
-(see `README.md`). No GPU is needed.
+Setup and every command to run: §0. Tested with Python 3.11, MuJoCo 3.14.0, NumPy 2.4, and on
+Ubuntu 22.04 / ROS 2 Humble with the system Python 3.10 and NumPy 1.26: identical results. The
+Gazebo part needs ROS 2 Humble, Gazebo Fortress, `install_dependency.sh`, and `colcon build` (see
+`README.md`). No GPU is needed for the sim; the vision's YOLO uses one if present (CPU works, slower).
 
 ## 4. How the original Gazebo sim works, and its bugs
 
@@ -180,6 +299,10 @@ Each decision was tested; see `mujoco/README.md` for numbers.
      turned out unnecessary (0). Mass and yaw inertia come from the roller model.
    - Dropped: pitch/roll, load transfer, the 12-contact vibration. ~30× real time per robot, ~20×
      for a full field (fixed ~95 µs per step, nearly independent of robot count).
+   - Looks: in the viewer the case is a see-through grey shell (render group 2) and each wheel is a
+     display-only body on a hinge that `PlanarDrive` sets to the wheel angle (no collisions, 1e-5 kg);
+     about +30 % per step, so the bridge adds them only with the viewer. Cameras rendered with
+     `vsss_field.camera_option()` see the opaque black collision box (group 3) instead.
 
 ## 6. Key results for the owner's robot (preset `vsss`)
 
@@ -235,10 +358,17 @@ Done since: the field, ball and multi-robot scene (`vsss_field.py`; dimensions f
 Division B defaults, corner triangles 7 cm; still to check against the current rules; ball
 rolling resistance is a guess), the ROS 2 bridge (`ros_bridge.py`), the idle limit cycle fix, the
 fast planar model, and the owner's 3-colour robot tops (colours sampled from their pattern sheet;
-team colour assumed at the front, ID colours at the rear: confirm with the owner).
+since corrected: the ID squares are the front, as in the old vision code). Ball and robot-case
+friction are 0.4 and 0.3 (guesses): with MuJoCo's default 1 on both the floor and the robot face, a
+pushed ball jammed (it locks once mu_face * mu_floor >= 1) and the robot crawled at 2 cm/s behind it.
+Also the stack of §9: `vsss_msgs`, `/field_truth`, the vision node with calibration and scoring.
 
 Not done yet:
 
+- **Vision on the real camera**: calibrate, sample colours, check the old YOLO weights on the
+  current robots (§9). Ball: 5 mm error in the sim from the silhouette centroid.
+- **Latency and ramps**: the radio delay and the firmware's ramp rates, measured, in the env and
+  optionally in the bridge (`--ramp` already sets the duty ramp).
 - **Roller-model transients** (§6): find why slipping rims inject energy (contact softness,
   `impratio`, timestep) before trusting its launch / stop / vibration numbers.
 - The Gym/PettingZoo environment: action pipeline (vx, vy, ω) → ramp limiter → inverse
@@ -265,7 +395,80 @@ Not done yet:
   predictions or the real robot before changing defaults, and record the result in
   `mujoco/README.md` and here.
 
-## 9. History (branch `humble`)
+## 9. The stack: vision, `/field` and control
+
+Same architecture as the owner's earlier system (github.com/arepo90/vsss: `vision` → `field_data` →
+`strat` → `/low{i}` → sim or ESP32 bridge), with RL taking over the strategy:
+
+```
+MuJoCo sim ── /overhead_camera/image_raw ──► vision_node ── /field ──► strategy / RL policy ── /<robot>/cmd_vel ──► sim
+(or a real camera)                                           ▲                                                    (or radio → ESP32)
+MuJoCo sim ── /field_truth (same message, exact) ────────────┘ for scoring the vision, or training without it
+```
+
+- **Messages** (`vsss_msgs`, owner's choice: modelled on their `sim_msgs`, cleaned up). `Field`:
+  header (stamp of the camera frame), `ball`, `blue[]`, `yellow[]`; `Object`: id (pattern id 1–10
+  blue, 11–20 yellow; ball 0), `detected`, x, y, theta, vx, vy, w in the field frame (m, rad; origin
+  at the centre, x towards the yellow goal). Absolute team colours: which team is "ours" is the
+  strategy's business. Commands stay `geometry_msgs/Twist` on `/<robot>/cmd_vel` (body frame).
+- **Patterns** (`vision/patterns.yaml`): the old vision's id table and the owner's pattern sheet.
+  The front of a robot is the ID-colour half (the old code measured heading from the robot centre
+  towards the ID squares, and its id table only matches the sheet that way); left/right are the
+  robot's own. The sim paints its robots from the same file, robot blue_i = id i+1, yellow_i = 11+i.
+- **Vision** (`vision/`), following the old YOLO vision (vsss commit 7490988, `vision_general.py`)
+  and reusing its YOLOv8m weights, which find sim robots at 0.88–0.89 confidence unchanged:
+  - YOLO runs in a background thread at up to 10 Hz (`--yolo_hz`) and finds robots; every frame
+    the colour patches are decoded in a window around each tracked robot and each YOLO box no
+    robot decoded in YOLO's own frame explains (comparing against tracks extrapolated back to that
+    frame left a trailing extra window behind robots that had just started or stopped).
+  - YOLO speed: torch 2.8.0+cu128 (2.0.1+cu117 had no kernels for the RTX 4060, sm_89, and took
+    44 ms). `YoloRobots` runs the fused network in fp16 as a CUDA graph with one wait for the GPU and
+    NMS in numpy: 12 ms and ~1 ms of CPU per run, against 23 ms through ultralytics' predictor; boxes
+    within 0.6 px of it. Every blocking torch call releases the GIL and can wait the 5 ms switch
+    interval to get it back, hence so few. `--yolo_hz 60` gives ~40 runs/s without slowing the
+    frame loop; 10 is enough since tracks follow known robots. When upgrading torch: the old
+    `nvidia-*-cu11` wheels overwrite same-named cu12 libraries (NCCL), so remove them.
+  - Windows are as wide as a robot top on each side of the robot centre. At 0.8× the edge cut a
+    touching robot's ID squares, their centroids moved inwards, and they could fit this robot's
+    team patch better than its own pair: a nonexistent id about once per 3 minutes of 3v3. The
+    tracker also won't open a track within 5 cm of another fresh one (robots are 7.5 cm wide).
+  - Colours: a 64³ lookup table built from reference colours (nearest in CIE Lab, with background
+    colours so dark/white pixels stay unlabelled): the old `lut_*.npy` idea, generated. Real
+    cameras: sample the patches with `calibrate.py --colors`.
+  - Geometry on the plane of the robot tops (7.05 cm), so parallax is removed (up to ~3 cm near the
+    goals at 2 m) and heading / left-right don't depend on image axes. The two ID squares are the
+    pair of ID-colour blobs that best fits the layout (35.5 mm apart, 35.5 mm from the team patch).
+  - Kalman filters: constant velocity per robot id (x, y, heading) and for the ball, timed by frame
+    stamps; a decoded id far from its track is ignored twice, then the track restarts there.
+  - Results on the sim (3v3, every robot in random start/stop bursts like hold-to-move teleop,
+    3 min at `--yolo_hz` 10 and 60 each): robots read with the right id 100 %, no wrong ids, no
+    reads of ids that aren't on the field; position 0.3 mm mean / 0.8 mm 95 %, heading 0.3° / 1.2°,
+    velocity 18 / 60 mm/s (robots at 0.1 / 0.5 m/s); ball found 100 %, 3–4 mm; 60 of 60 frames/s at
+    3.0–3.3 ms each, exactly one window per robot; frames are 18–20 ms old when `/field` goes out.
+    Offline on 40 random frames: 240/240 ids, 0.1 mm, 0.34°; 600 touching pairs: 600/600.
+  - Calibration: the camera is fixed, so it's done once, like the old homography clicks, but it
+    solves the full camera pose (6 line points, SQPnP; IPPE picked a wrong pose from straight above).
+    Intrinsics from a checkerboard `camera_info`, or a lens guess plus the measured camera height:
+    from straight above the floor can't separate focal length from height, and the height sets the
+    parallax correction. 0.5 px click noise → 1.4 mm mean error (12 mm without the height). Through
+    the node with such a file: 3.0 mm, 100 % ids.
+- **Low-level control** (assessment of Guldner & Utkin 1995, sliding mode gradient tracking,
+  `vsss/Sliding_mode_control_for_gradient_tracki-1.pdf`, which the old strategy built on): its
+  controller needs force inputs and fast full-state feedback. The robot has PWM into self-locking
+  worms (a velocity source with ~35 ms lag), no encoders, and 60 Hz camera feedback with 30–90 ms of
+  latency; the switching law would chatter, and smoothing it leaves a saturated P controller. So:
+  per-robot duty → speed calibration from the camera (removes the ~20 % open-loop shortfall and the
+  deadband), firmware ramps at the traction limit, and optionally a slow (~1 Hz) integral trim on
+  the vision velocity. Keep from the paper: the speed profile v = min(a₀t, v₀, √(2a₀d)) (time-optimal
+  under an acceleration limit; stops without overshoot) for the software limiter, and its
+  potentials as potential-based reward shaping for RL (γΦ(s') − Φ(s) keeps the optimal policy) and
+  as a scripted baseline.
+- **RL** does all the high-level control and strategy, consuming `/field` (or the same state inside
+  the training env) and producing `cmd_vel`. The real robots have a radio delay, which forced accel
+  / decel ramps in the firmware; in the sim starts and stops are nearly instant with the default
+  `--ramp 0.2`. Both belong in the env (latency queue, the firmware's ramp rates).
+
+## 10. History (branch `humble`)
 
 - `1f6905d` MuJoCo port: generator, drive test, URDF importer.
 - `2be0b4d` single-row wheels: roller length capped by neighbours.
@@ -275,7 +478,12 @@ Not done yet:
   tests, COM 25 mm, contact 10 ms, this file.
 - `fc5fe35` owner's answers (self-locking confirmed, TB6612FNG, friction and radius estimates),
   `stop_mode`, `kinematic_radius`.
-- next commit: VSSS field + ball + overhead camera (`vsss_field.py`), ROS 2 bridge
+- `bc49197` VSSS field + ball + overhead camera (`vsss_field.py`), ROS 2 bridge
   (`ros_bridge.py`), multi-robot `Drive`, idle limit cycle fix, fast planar model with self-locking
   as a load guard (`planar_robot.py`), the owner's 3-colour robot tops, roller-model transient
   artefacts documented.
+- this commit: teleop, quickstart, ball/case friction, see-through cases and display wheels,
+  guard-based self-locking, `vsss_msgs` + `/field_truth`, pattern table (front = ID squares), the
+  vision (YOLO + colour patches + Kalman, calibration, scoring; torch 2.8 with fp16 CUDA-graph
+  YOLO, windows checked against YOLO's own frame and wide enough for touching robots), the
+  low-level control assessment.

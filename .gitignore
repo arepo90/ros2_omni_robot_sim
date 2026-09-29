@@ -1,0 +1,4 @@
+# colcon output (colcon build --base-paths msgs)
+build/
+install/
+log/

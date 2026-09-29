@@ -18,6 +18,7 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 | `planar_robot.py` | Fast planar robot: a box on the floor (x, y, yaw) pushed by one traction force per wheel, same motor and self-locking rule. ~20× real time for a full field. `python3 planar_robot.py` compares it with the roller model. |
 | `vsss_field.py` | The VSSS field with walls, goals, lines, the ball, up to 5 robots per team (planar or roller) and an overhead camera. |
 | `ros_bridge.py` | ROS 2 (rclpy) bridge: `cmd_vel` per robot in; ground-truth odometry, IMU, wheels, duty, TF, `/clock` and the camera image out. |
+| `teleop.py` | Terminal keyboard teleop: W/S, A/D, Q/E, ↑/↓ speed; the robot moves only while keys are held (reads held keys from X11). |
 | `import_repo_urdf.py` | 1:1 import of the Gazebo robots (`3w_v2`, `4w`, `5w`, `6w`) for comparison. |
 
 ## VSSS field and ROS 2 bridge
@@ -27,8 +28,8 @@ python3 vsss_field.py --blue 3 --yellow 3        # writes vsss_field.xml; python
 source /opt/ros/humble/setup.bash
 python3 ros_bridge.py                             # 3 blue robots, ball, overhead camera, MuJoCo viewer window
 python3 ros_bridge.py --blue 3 --yellow 3 --no_viewer
-python3 ros_bridge.py --model roller              # detailed roller-level robots (slow: 3v3 below real time)
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/blue_0/cmd_vel   # Shift+J/L strafe
+python3 ros_bridge.py --model roller --blue 1     # the full roller-level model (real time up to 3 robots)
+python3 teleop.py                                 # WASD move, QE turn, arrows speed; only while held (--robot yellow_1)
 ros2 run rqt_image_view rqt_image_view /overhead_camera/image_raw
 ros2 topic echo /blue_0/odom        # or plot it: rqt_plot, plotjuggler
 ros2 service call /reset std_srvs/srv/Empty
@@ -42,6 +43,7 @@ ros2 service call /reset std_srvs/srv/Empty
 | `/<robot>/wheels` | `sensor_msgs/JointState` | wheel angle, speed, torque on the wheel |
 | `/<robot>/duty` | `std_msgs/Float64MultiArray` | PWM duty per wheel after the ramp |
 | `/ball/odom` | `nav_msgs/Odometry` | ball position and velocity |
+| `/field_truth` | `vsss_msgs/Field` | everything in the vision's format, exact (needs `vsss_msgs` built, see `reference.md` §0) |
 | `/overhead_camera/image_raw`, `/camera_info` | `sensor_msgs/Image` (rgb8), `CameraInfo` | 640×480 at 60 Hz by default |
 | `/tf`, `/tf_static`, `/clock` | | `field` → `<robot>/base_link`, `field` → `overhead_camera_optical`; sim time |
 
@@ -84,7 +86,9 @@ real time when unpaced (`--real_time 0`), mostly spent building ROS messages.
 **Field:** FIRASim's Division B defaults (the league's simulator): 150 × 130 cm matte black floor,
 5 cm walls 2.5 cm thick, 40 × 10 cm goals, 3 mm lines, 20 cm centre circle, 70 × 15 cm defense
 areas, 7 cm corner triangles, orange golf ball (42.7 mm, 46 g). Check them against the current
-rules. The ball's rolling resistance is a guess.
+rules. The ball's rolling resistance and friction (0.4, set with priority so it governs every ball
+contact) and the robot case friction (0.3) are guesses. They matter: with MuJoCo's default 1 on
+both the floor and the robot face, a pushed ball jams and the robot crawls behind it at 2 cm/s.
 
 **Robot tops:** black 7.5 cm cube with the team's 3-colour pattern: team colour (blue / yellow)
 across the front half, two ID colours side by side on the rear half (left, right seen from above
@@ -92,7 +96,9 @@ with the front up), 4 mm black borders. Colours are sampled from the team's patt
 (5, 11, 159), yellow (255, 230, 13), red (204, 0, 1), green (0, 204, 8), cyan (0, 170, 206), magenta
 (205, 23, 220). Robot i uses pair i of the sheet's 10 (`vsss_field.ID_PAIRS`: RG, RC, GR, GC, GM, CR,
 CG, CM, MG, MC). Lighting sums to 1 on surfaces facing the camera, so the tops render in exactly these
-colours.
+colours. In the viewer the case is see-through grey and the wheels show (display-only, turning,
+for the planar model); the overhead camera renders with `vsss_field.camera_option()` and sees the
+opaque black case, like the real robot.
 
 **Camera:** a pinhole camera looking straight down from `--cam_z 2.0` m, its field of view fitted to
 the field (`--cam_fovy` to set it, `--cam_width/--cam_height`, `--cam_hz`). `camera_info` matches
