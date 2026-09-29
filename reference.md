@@ -64,8 +64,12 @@ urdf/{3w,3w_v2,4w,5w,6w}/   robots; 3w_v2/4w/5w/6w share the same wheel and roll
 config/controller_configs/  ros2_control: one JointGroupVelocityController per wheel, 50 Hz
 launch/                     gazebo_sim / slam / navigation launch files (OMNI_ROBOT_MODEL env var)
 mujoco/omni_mjcf.py         parametric MJCF generator + wheel Jacobian + presets ("generic", "vsss")
-mujoco/drive.py             Drive(m, p).step(d, u): servo / dc / worm-gear motor models
+mujoco/drive.py             Drive(m, p).step(d, u): servo / dc / worm-gear motor models; apply()/update()
+                            around one shared mj_step for several robots (name prefix)
 mujoco/test_drive.py        validation: tracking, launch, sudden/ramped stop, push tests
+mujoco/planar_robot.py      fast planar robot (box + one traction force per wheel) + side-by-side test
+mujoco/vsss_field.py        VSSS field (walls, goals, lines), ball, N robots (planar/roller), camera, via MjSpec
+mujoco/ros_bridge.py        rclpy bridge: <robot>/cmd_vel in; odom, imu, wheels, duty, camera, tf, clock out
 mujoco/import_repo_urdf.py  1:1 import of the Gazebo URDFs into MuJoCo (needs `pip install xacro`)
 mujoco/README.md            usage and parameter documentation
 ```
@@ -73,8 +77,10 @@ mujoco/README.md            usage and parameter documentation
 Setup: clone the repo and `git checkout humble`, then `pip install mujoco numpy` (and `xacro` for
 the importer). Run `python mujoco/test_drive.py --preset vsss` and view with
 `python -m mujoco.viewer --mjcf=vsss_omni4.xml` after `python mujoco/omni_mjcf.py --preset vsss`.
-Tested with Python 3.11, MuJoCo 3.14.0, NumPy 2.4. The Gazebo part needs ROS 2 Humble, Gazebo
-Fortress, `install_dependency.sh`, and `colcon build` (see `README.md`). No GPU is needed.
+Tested with Python 3.11, MuJoCo 3.14.0, NumPy 2.4. Also on Ubuntu 22.04 / ROS 2 Humble with the
+system Python 3.10 and NumPy 1.26 (Humble's rclpy and cv_bridge need NumPy < 2): identical results.
+The Gazebo part needs ROS 2 Humble, Gazebo Fortress, `install_dependency.sh`, and `colcon build`
+(see `README.md`). No GPU is needed.
 
 ## 4. How the original Gazebo sim works, and its bugs
 
@@ -148,6 +154,32 @@ Each decision was tested; see `mujoco/README.md` for numbers.
      diverged otherwise; checked in code), and `contact_timeconst` ≥ 2 × `timestep` (0.5 ms).
    - `gear_backlash` is experimental. It caused rocking on the 12 contacts and exaggerated flank
      impacts, so it's 0 in the preset.
+   - Without backlash the gear holds both ways (both flanks engaged) with stiffness 1 N·m/rad
+     (`coupling_kv` × `_KP` 50). The first version kept the one-sided flank logic at zero backlash
+     and used 4 N·m/rad; a resting robot then fell into a ~22 Hz limit cycle (wheels ±0.25 rad/s,
+     rollers up to 18 rad/s, yaw −4.3° in 20 s). Both changes were needed; raising roller damping
+     instead also stopped it but made a sudden stop pitch 29°. Tracking and launch didn't change.
+8. **Fast planar model** (`planar_robot.py`, the default in the field and bridge). A box on
+   slide x / slide y / hinge yaw joints; each wheel is a site actuator at its contact point pushing
+   along the rolling direction with k·(r_eff·ω − v_t), capped at μ·N (N = mg/4, no load transfer),
+   free along the axle. Same DC motor curve, rotor inertia, gearbox friction and PWM modes as
+   `drive.py`.
+   - Self-locking is one guard, not a gear model: the load the wheel puts on the motor is clamped
+     so the ground can resist the motor but never drive it. The motor speed is solved with backward
+     Euler each step (three closed-form cases: unloaded, loaded and gripping, loaded and slipping),
+     using the same v_t MuJoCo then uses for the traction force (`mj_step1` / `mj_step2`). Results
+     agree to < 1 mm between 0.5 and 4 ms steps, robot kinetic energy matches the traction work to
+     1 %, and robots at duty 0 don't move (0.00 µm in 10 s after 60 s of random 3v3 driving).
+     A first version carried a "driving or back-driven" state between steps and needed an implicit
+     load term plus a sign-flip patch; this replaces both.
+   - Traction is integrated explicitly (semi-implicit Euler) at 2 ms: the implicit integrators keep
+     the velocity derivative of a force-capped actuator, which acted like extra mass while the
+     wheels slipped (6.1 instead of 6.9 m/s² at the traction limit).
+   - Rolling losses (`rolling_resistance` 0.03, `rolling_damping` 6e-5 N·m·s/rad) are part of the
+     clamped load, fitted to the roller model's steady-state tracking; roller drag and yaw scrub
+     turned out unnecessary (0). Mass and yaw inertia come from the roller model.
+   - Dropped: pitch/roll, load transfer, the 12-contact vibration. ~30× real time per robot, ~20×
+     for a full field (fixed ~95 µs per step, nearly independent of robot count).
 
 ## 6. Key results for the owner's robot (preset `vsss`)
 
@@ -158,17 +190,30 @@ Each decision was tested; see `mujoco/README.md` for numbers.
   through the camera, or the feed-forward must be calibrated.
 - **Traction limits** (X layout): ≈ 0.71·μ·g along the body axes and 0.5·μ·g along the diagonals.
   The motors (stall 0.023 N·m) exceed this at low speed, so full-duty starts spin the wheels a little.
-- **Stops and pitch:**
-  - sudden stop from full speed with `stop_mode brake`: ~35 mm, ~10° pitch (~8 mm side lift);
-  - with `stop_mode coast`: rolls ~19 cm with ~1 mm lift;
-  - 200 ms ramp (either mode, since the TB6612 brakes in PWM off-time): ~2 mm lift.
+- **Stops and pitch** (after the idle fix, §5.7):
+  - sudden stop from full speed with `stop_mode brake`: ~43 mm, ~6° pitch (~5 mm side lift);
+    before the fix 35 mm, 10°, 8 mm;
+  - with `stop_mode coast`: rolls ~21 cm with ~0 mm lift;
+  - 200 ms ramp (either mode, since the TB6612 brakes in PWM off-time): 65 mm, ~2 mm lift.
   - The owner saw "a couple of mm" without ramps, which falls between the two; rotor inertia is
     the main unknown, plus which stop mode the firmware used.
-- **Being pushed:** the unpowered robot resists 1.70 N along a body axis and 1.32 N along a
+- **Being pushed:** the unpowered robot resists 1.74 N along a body axis and 1.52 N along a
   diagonal (predictions 1.60 / 1.13 N at μ = 1). Pushed robots skid rather than roll.
+- **Roller-model transients are suspect.** On a full-duty launch the robot gains more kinetic
+  energy than the gears deliver to the wheels (3.1 vs 1.6 mJ at 20 ms, 36.5 vs 30.2 mJ at
+  100 ms) and exceeds the 6.9 m/s² traction limit (peak 8.9); the slipping rims bounce on the soft
+  contacts (contact count 0–6). In the 200 ms ramp stop the robot stops, then rolls back at
+  0.2 m/s, while its wheels still turn forward. So the 138 ms launch and the ramp-stop distance
+  are artefacts; the planar model (204 ms, 109 mm) follows the motor model. Steady-state results
+  are consistent (energy balances, planar fit matches).
 - **Vibration:** peaks around 0.4–0.5 m/s at 0.5–1.3 g rms, depending on contact softness.
-- **Sim speed:** ~6–8× real time for one robot on one CPU core, too slow for large-scale MARL
-  self-play (see §8).
+- **Sim speed:** roller model ~6–8× real time for one robot; on the field 4.7× with 1 robot, 2.0×
+  with 3, 1.08× for 3v3 (bridge with viewer 0.8×). Planar model ~20× for a full field; the bridge
+  holds real time for 3v3 with viewer and camera. Still far too slow for large-scale MARL self-play:
+  that needs the planar equations batched (numpy/torch/JAX over many environments) or MJX.
+- **Idle:** both models now stay still at duty 0 (60 s: no drift). The roller model used to fall
+  into a ~22 Hz limit cycle, fixed in `drive.py` (§5.7); `test_drive.py` settles for only
+  0.3–0.5 s, so it never showed up.
 
 ## 7. Open items
 
@@ -186,20 +231,24 @@ Values to measure (procedures are in `mujoco/README.md`, "Still placeholders"):
 - **`com_height`:** balance test.
 - **Firmware ramp rates:** model them exactly in the environment.
 
+Done since: the field, ball and multi-robot scene (`vsss_field.py`; dimensions from FIRASim's
+Division B defaults, corner triangles 7 cm; still to check against the current rules; ball
+rolling resistance is a guess), the ROS 2 bridge (`ros_bridge.py`), the idle limit cycle fix, the
+fast planar model, and the owner's 3-colour robot tops (colours sampled from their pattern sheet;
+team colour assumed at the front, ID colours at the rear: confirm with the owner).
+
 Not done yet:
 
-- The VSSS field (verify dimensions against current rules, commonly 150 × 130 cm with walls and
-  goals), the ball (commonly an orange golf ball; verify), and multi-robot scenes. The chassis
-  collision bitmask already allows robot–robot and ball contacts.
+- **Roller-model transients** (§6): find why slipping rims inject energy (contact softness,
+  `impratio`, timestep) before trusting its launch / stop / vibration numbers.
 - The Gym/PettingZoo environment: action pipeline (vx, vy, ω) → ramp limiter → inverse
   kinematics with r_eff → duty feed-forward (plus deadband compensation) → latency queue →
   `Drive.step`. Observations should come from the simulated overhead tracker (no encoders on the
   real robot), with privileged state only for the critic. Also domain randomization of battery
   voltage, friction, mass/COM, motor gains and latency.
-- A fast simplified robot model for MARL, e.g. planar dynamics with a wheel-level slip and traction
-  model fitted to the roller model, or MJX. Keep the roller model as the reference for sysID and
-  validation.
-- An optional ROS 2 bridge (MuJoCo ↔ `/cmd_vel`, `/odom`, `/imu`).
+- Batch the planar model for MARL (vectorised numpy/torch/JAX across environments, or MJX), and
+  fit its placeholders (rotor inertia, rolling losses, μ) to the real robot with the camera.
+  Keep the roller model as the reference for geometry questions.
 - The `src/kinematics.cpp` fixes from §4.
 
 ## 8. Conventions
@@ -224,5 +273,9 @@ Not done yet:
 - `0f656a3` `vsss` preset for the real robot, hub collision, supply voltage.
 - `c58d59b` worm-gear drive model (`drive.py`), elliptic cones + `impratio`, launch/stop/push
   tests, COM 25 mm, contact 10 ms, this file.
-- next commit: owner's answers (self-locking confirmed, TB6612FNG, friction and radius estimates),
+- `fc5fe35` owner's answers (self-locking confirmed, TB6612FNG, friction and radius estimates),
   `stop_mode`, `kinematic_radius`.
+- next commit: VSSS field + ball + overhead camera (`vsss_field.py`), ROS 2 bridge
+  (`ros_bridge.py`), multi-robot `Drive`, idle limit cycle fix, fast planar model with self-locking
+  as a load guard (`planar_robot.py`), the owner's 3-colour robot tops, roller-model transient
+  artefacts documented.

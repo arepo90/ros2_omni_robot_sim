@@ -13,9 +13,98 @@ python -m mujoco.viewer --mjcf=vsss_omni4.xml
 | file | what it is |
 |---|---|
 | `omni_mjcf.py` | Parametric MJCF generator. Any wheel count, layout, size, roller count, motor model. Also has `wheel_jacobian()` / `body_twist()` (same math as `src/kinematics.cpp`). |
-| `drive.py` | `Drive(m, p).step(d, u)`: steps the sim with wheel commands (speeds for `servo`, PWM duty for `dc` / `worm`); holds the worm-gear model. |
+| `drive.py` | `Drive(m, p).step(d, u)`: steps the sim with wheel commands (speeds for `servo`, PWM duty for `dc` / `worm`); holds the worm-gear model. With several robots: `Drive(m, p, prefix="blue_0/")`, `apply()` each, one `mj_step`, `update()` each. |
 | `test_drive.py` | Open-loop tracking test (vx, vy, diagonal, spin, arc); for `dc` / `worm` also launch, sudden and ramped stop, and push tests. |
+| `planar_robot.py` | Fast planar robot: a box on the floor (x, y, yaw) pushed by one traction force per wheel, same motor and self-locking rule. ~20× real time for a full field. `python3 planar_robot.py` compares it with the roller model. |
+| `vsss_field.py` | The VSSS field with walls, goals, lines, the ball, up to 5 robots per team (planar or roller) and an overhead camera. |
+| `ros_bridge.py` | ROS 2 (rclpy) bridge: `cmd_vel` per robot in; ground-truth odometry, IMU, wheels, duty, TF, `/clock` and the camera image out. |
 | `import_repo_urdf.py` | 1:1 import of the Gazebo robots (`3w_v2`, `4w`, `5w`, `6w`) for comparison. |
+
+## VSSS field and ROS 2 bridge
+
+```bash
+python3 vsss_field.py --blue 3 --yellow 3        # writes vsss_field.xml; python3 -m mujoco.viewer --mjcf=vsss_field.xml
+source /opt/ros/humble/setup.bash
+python3 ros_bridge.py                             # 3 blue robots, ball, overhead camera, MuJoCo viewer window
+python3 ros_bridge.py --blue 3 --yellow 3 --no_viewer
+python3 ros_bridge.py --model roller              # detailed roller-level robots (slow: 3v3 below real time)
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/blue_0/cmd_vel   # Shift+J/L strafe
+ros2 run rqt_image_view rqt_image_view /overhead_camera/image_raw
+ros2 topic echo /blue_0/odom        # or plot it: rqt_plot, plotjuggler
+ros2 service call /reset std_srvs/srv/Empty
+```
+
+| topic | type | what |
+|---|---|---|
+| `/<robot>/cmd_vel` | `geometry_msgs/Twist` | in: body-frame `linear.x`, `linear.y` [m/s], `angular.z` [rad/s] |
+| `/<robot>/odom` | `nav_msgs/Odometry` | ground truth: pose in `field`, twist in `<robot>/base_link` |
+| `/<robot>/imu` | `sensor_msgs/Imu` | IMU at the chassis centre, noise-free |
+| `/<robot>/wheels` | `sensor_msgs/JointState` | wheel angle, speed, torque on the wheel |
+| `/<robot>/duty` | `std_msgs/Float64MultiArray` | PWM duty per wheel after the ramp |
+| `/ball/odom` | `nav_msgs/Odometry` | ball position and velocity |
+| `/overhead_camera/image_raw`, `/camera_info` | `sensor_msgs/Image` (rgb8), `CameraInfo` | 640×480 at 60 Hz by default |
+| `/tf`, `/tf_static`, `/clock` | | `field` → `<robot>/base_link`, `field` → `overhead_camera_optical`; sim time |
+
+Robots are `blue_0`..`blue_4` and `yellow_0`..`yellow_4`. The field frame has its origin at the
+centre, x towards the yellow goal, z up. `cmd_vel` goes through what the firmware does: inverse
+kinematics, the no-load duty feed-forward (`--ff_gain`), a ramp (`--ramp 0.2` s for 0 → 100 %),
+and the motor model. It is open loop, so robots reach ~75–82 % of the commanded speed. A
+command holds until the next one (`--cmd_timeout` to stop instead). Stamps and `/clock` are wall
+start time + sim time; if the sim can't keep up (only with `--model roller`), set `use_sim_time`
+in your tools.
+
+**Robot model** (`--model`): `planar` (default) is a 7.5 cm box on the floor with one traction force
+per wheel (`planar_robot.py`); `roller` is the roller-level model the rest of this README describes.
+The planar model keeps the motor curve, rotor inertia, gearbox friction and the traction limit, and
+drops rollers, pitch and vibration. Self-locking isn't simulated: it's one guard on the motor's load,
+"the ground may resist the motor, never drive it". When the ground would push (braking, being pushed,
+coasting) the wheel keeps the motor's own speed and the traction brakes the robot. The motor speed is
+solved with backward Euler each step, so results don't depend on the step size (0.5–4 ms agree
+to < 1 mm) and a robot at duty 0 can't move. Its losses are fitted to the roller model's steady-state
+tracking (`python3 planar_robot.py`):
+
+| test | roller | planar |
+|---|---|---|
+| open loop 0.5 / 0.3 m/s along x | 82 / 75 % | 82 / 75 % |
+| diagonal, spin 6 rad/s, arc | 83, 74, 71/90 % | 84, 74, 73/93 % |
+| full duty: top speed, 0 → 90 % | 0.76 m/s, 140 ms* | 0.76 m/s, 204 ms |
+| sudden stop, brake / coast | 40 / 207 mm | 42 / 231 mm |
+| 200 ms ramp stop | 67 mm* | 109 mm |
+| push unpowered, x / diagonal | 1.72 / 1.39 N | 1.66 / 1.23 N |
+| idle 10 s | still | still |
+| speed, one robot | 6× real time | ~30× |
+
+\* roller-model contact artefacts: on launch the robot gains more energy than the motors put in
+(it passes the 6.9 m/s² traction limit), and in the ramp stop it stops, even rolls back, while its
+wheels still turn forward. The planar values follow from the motor model (rotor inertia is still a
+placeholder). On the full field the planar physics runs ~20× real time (~95 µs per 2 ms step) with
+1 to 10 robots; the bridge holds real time for 3v3 with the viewer and camera, and runs ~3–4×
+real time when unpaced (`--real_time 0`), mostly spent building ROS messages.
+
+**Field:** FIRASim's Division B defaults (the league's simulator): 150 × 130 cm matte black floor,
+5 cm walls 2.5 cm thick, 40 × 10 cm goals, 3 mm lines, 20 cm centre circle, 70 × 15 cm defense
+areas, 7 cm corner triangles, orange golf ball (42.7 mm, 46 g). Check them against the current
+rules. The ball's rolling resistance is a guess.
+
+**Robot tops:** black 7.5 cm cube with the team's 3-colour pattern: team colour (blue / yellow)
+across the front half, two ID colours side by side on the rear half (left, right seen from above
+with the front up), 4 mm black borders. Colours are sampled from the team's pattern sheet: blue
+(5, 11, 159), yellow (255, 230, 13), red (204, 0, 1), green (0, 204, 8), cyan (0, 170, 206), magenta
+(205, 23, 220). Robot i uses pair i of the sheet's 10 (`vsss_field.ID_PAIRS`: RG, RC, GR, GC, GM, CR,
+CG, CM, MG, MC). Lighting sums to 1 on surfaces facing the camera, so the tops render in exactly these
+colours.
+
+**Camera:** a pinhole camera looking straight down from `--cam_z 2.0` m, its field of view fitted to
+the field (`--cam_fovy` to set it, `--cam_width/--cam_height`, `--cam_hz`). `camera_info` matches
+the rendered image to 0.5 px. It sees perspective like a real overhead camera: a robot top 7 cm up
+appears ~3.6 % further from the image centre than its footprint, 2.7 cm at the goal lines, so the
+vision pipeline has to correct for marker height. `--cam_ortho` gives a flat map without parallax
+(no `camera_info` then). Images are clean: no lens distortion, blur or noise.
+
+Checks (roller model): each robot on the field tracks exactly like the lone robot in
+`test_drive.py` (0.407 m/s for 0.5 m/s commanded along y, with 1, 3 or 6 robots), and
+`test_drive.py` output is unchanged by the multi-robot `Drive`. Roller physics runs 4.7× real time
+with 1 robot, 2.0× with 3, 1.08× with 6.
 
 ## The real robot (`--preset vsss`)
 
@@ -49,6 +138,9 @@ driven the usual way (IN1/IN2 set the direction, PWM on the PWM pin), the off-ti
 A zero command brakes if the direction pins stay set, and coasts if the firmware sets IN1 = IN2 = low. Step it with
 `Drive(m, p).step(d, duty)` instead of `mj_step`. `gear_backlash` exists but is experimental: the
 free play lets the robot rock on its 12 contacts, and flank impacts clunk harder than real gears.
+Without backlash the gear holds both ways, with a stiffness of 1 N·m/rad (`coupling_kv` × `_KP`).
+A one-sided flank and 4 N·m/rad made a resting robot fall into a ~22 Hz limit cycle (wheels ±0.25
+rad/s, rollers up to 18 rad/s, yaw drifting −4° in 20 s); now it stays still.
 
 ### Results (`python test_drive.py --preset vsss`)
 
@@ -56,11 +148,11 @@ free play lets the robot rock on its 12 contacts, and flank impacts clunk harder
 |---|---|
 | open-loop duty from the no-load curve, 0.5 m/s along x / y | 81–82 % of commanded (gearbox friction ~8 %, rolling losses over the 12 contacts ~10 %) |
 | spin 6 rad/s / arc | 74 % / 70–91 % |
-| full duty along x | 0.76 m/s, 0→90 % in 138 ms, peak 9 m/s², 3° pitch |
-| sudden stop from 0.76 m/s, `stop_mode brake` | stops in 35 mm, ~10° pitch (~8 mm side lift) |
-| sudden stop, `stop_mode coast` | rolls ~19 cm, ~1° (~1 mm lift) |
-| 200 ms ramp (either stop mode) | 55 mm, ~2° (~2 mm lift) |
-| push the unpowered robot until it slides | 1.70 N along x, 1.32 N along a diagonal |
+| full duty along x | 0.76 m/s, 0→90 % in 138 ms, peak 9 m/s², 3° pitch (too fast: contact artefact, see above) |
+| sudden stop from 0.76 m/s, `stop_mode brake` | stops in 43 mm, ~6° pitch (~5 mm side lift) |
+| sudden stop, `stop_mode coast` | rolls ~21 cm, ~1° (~0 mm lift) |
+| 200 ms ramp (either stop mode) | 65 mm, ~3° (~2 mm lift) (the robot outruns its wheels: contact artefact) |
+| push the unpowered robot until it slides | 1.74 N along x, 1.52 N along a diagonal |
 
 Pushing checks the friction anisotropy. With the wheels locked, each wheel resists only along its
 drive direction (its rollers roll freely along the axle). That predicts 0.707·μ·m·g = 1.60 N along
